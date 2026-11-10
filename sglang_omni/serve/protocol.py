@@ -436,7 +436,9 @@ SUPPORTED_TTS_LANGUAGES = frozenset(
         "Italian",
     }
 )
-SUPPORTED_TTS_TASK_TYPES = frozenset({"Base", "CustomVoice", "VoiceDesign"})
+SUPPORTED_TTS_TASK_TYPES = frozenset(
+    {"Base", "CustomVoice", "VoiceDesign", "Direct", "PlanFull", "PlanMelody", "Cover"}
+)
 TTS_SPEED_MIN = 0.25
 TTS_SPEED_MAX = 4.0
 DEFAULT_TTS_BATCH_MAX_ITEMS = 32
@@ -477,12 +479,12 @@ class CreateSpeechRequest(BaseModel):
     stream_format: Literal["audio", "sse"] = "audio"
 
     # Advanced TTS extensions
-    task_type: str | None = None  # e.g. "Base", "CustomVoice", "VoiceDesign"
+    task_type: str | None = None
     language: str | None = None
     instructions: str | None = None  # style/emotion instructions
 
     # Voice cloning parameters
-    ref_audio: str | None = None  # path or URL to reference audio
+    ref_audio: str | None = None  # reference audio, or raw ABC text for HeartMoE Cover
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
     x_vector_only_mode: bool | None = None

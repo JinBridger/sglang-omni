@@ -26,12 +26,11 @@ from sglang_omni.serve.streaming import ClosableStreamingResponse
 
 logger = logging.getLogger(__name__)
 PCM_SAMPLE_WIDTH_BYTES = 2
-PCM_CHANNELS = 1
 STREAMING_WAV_SIZE = 0xFFFFFFFF
 
 
-def create_streaming_wav_header(sample_rate: int) -> bytes:
-    """Describe a mono PCM stream whose final size is not known yet."""
+def create_streaming_wav_header(sample_rate: int, channels: int) -> bytes:
+    """Describe a PCM stream whose final size is not known yet."""
     return struct.pack(
         "<4sI4s4sIHHIIHH4sI",
         b"RIFF",
@@ -40,10 +39,10 @@ def create_streaming_wav_header(sample_rate: int) -> bytes:
         b"fmt ",
         16,
         1,
-        PCM_CHANNELS,
+        channels,
         sample_rate,
-        sample_rate * PCM_CHANNELS * PCM_SAMPLE_WIDTH_BYTES,
-        PCM_CHANNELS * PCM_SAMPLE_WIDTH_BYTES,
+        sample_rate * channels * PCM_SAMPLE_WIDTH_BYTES,
+        channels * PCM_SAMPLE_WIDTH_BYTES,
         PCM_SAMPLE_WIDTH_BYTES * 8,
         b"data",
         STREAMING_WAV_SIZE,
@@ -55,28 +54,30 @@ def speech_pcm_chunk_bytes(
     *,
     emitted_samples: int,
     speed: float,
-) -> tuple[bytes | None, int, int]:
+) -> tuple[bytes | None, int, int, int]:
     sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
     audio_data, emitted_samples = select_audio_delta(
         chunk.audio_data,
         emitted_samples=emitted_samples,
         is_terminal=chunk.finish_reason is not None,
+        keep_channels=True,
     )
-    if audio_data is None:
-        return None, emitted_samples, sample_rate
+    if audio_data is None or audio_data.size == 0:
+        return None, emitted_samples, sample_rate, 0
     else:
         pass
 
+    channels = int(audio_data.shape[0]) if audio_data.ndim == 2 else 1
     if speed != 1.0:
         audio_data, sample_rate = apply_speed(audio_data, speed, sample_rate)
     else:
         pass
     audio_bytes = encode_pcm(audio_data, sample_rate)
     if not audio_bytes:
-        return None, emitted_samples, sample_rate
+        return None, emitted_samples, sample_rate, channels
     else:
         pass
-    return audio_bytes, emitted_samples, sample_rate
+    return audio_bytes, emitted_samples, sample_rate, channels
 
 
 def create_speech_sse_response(
@@ -84,6 +85,7 @@ def create_speech_sse_response(
     *,
     stream_outcome: SpeechStreamOutcome,
     sample_rate: int,
+    channels: int,
     response_format: Literal["pcm", "wav"],
     enable_speech_sse_named_events: bool,
     headers: dict[str, str],
@@ -105,14 +107,14 @@ def create_speech_sse_response(
                 audio_packets: tuple[bytes, ...]
                 if not emitted_audio and response_format == "wav":
                     audio_packets = (
-                        create_streaming_wav_header(sample_rate),
+                        create_streaming_wav_header(sample_rate, channels),
                         pcm_bytes,
                     )
                 else:
                     audio_packets = (pcm_bytes,)
 
                 duration_seconds += len(pcm_bytes) / (
-                    PCM_SAMPLE_WIDTH_BYTES * PCM_CHANNELS * sample_rate
+                    PCM_SAMPLE_WIDTH_BYTES * channels * sample_rate
                 )
                 for audio_packet in audio_packets:
                     delta = {

@@ -546,6 +546,20 @@ class SpeechRequestValidator:
     def prepare_reference_fields(
         self, request: CreateSpeechRequest
     ) -> PreparedSpeechReferences:
+        if (
+            request.task_type is not None
+            and normalize_task_type(request.task_type) == "Cover"
+        ):
+            if request.ref_audio is None or not request.ref_audio.strip():
+                raise bad_request(
+                    "Cover requires non-empty ABC text in ref_audio", param="ref_audio"
+                )
+            else:
+                return PreparedSpeechReferences(
+                    request_updates={}, reference_descriptors=[], uploaded_voice=None
+                )
+        else:
+            pass
         updates: SpeechRequestUpdates = {}
         reference_descriptors: list[SpeechReferenceDescriptor] = []
         uploaded_voice = self.resolve_uploaded_voice_reference(request)
@@ -1333,6 +1347,13 @@ def reference_dict_from_media_reference(value: str) -> dict[str, str]:
 def reference_descriptors_from_request(
     request: CreateSpeechRequest,
 ) -> list[SpeechReferenceDescriptor]:
+    if (
+        request.task_type is not None
+        and normalize_task_type(request.task_type) == "Cover"
+    ):
+        return []
+    else:
+        pass
     references: list[SpeechReferenceDescriptor] = []
     if request.references:
         references.extend(

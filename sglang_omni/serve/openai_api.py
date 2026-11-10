@@ -2188,6 +2188,7 @@ async def speech_audio_response(
     chunk_stream = client.generate(gen_req, request_id=request_id)
     first_audio_bytes: bytes | None = None
     stream_sample_rate: int | None = None
+    stream_channels: int | None = None
     stream_completed = False
     stream_closed = False
     disconnect_task = asyncio.create_task(wait_for_request_disconnect(request))
@@ -2222,7 +2223,7 @@ async def speech_audio_response(
             else:
                 pass
 
-            first_audio_bytes, emitted_samples, stream_sample_rate = (
+            first_audio_bytes, emitted_samples, stream_sample_rate, stream_channels = (
                 speech_pcm_chunk_bytes(
                     chunk,
                     emitted_samples=emitted_samples,
@@ -2234,7 +2235,11 @@ async def speech_audio_response(
             else:
                 pass
 
-        if first_audio_bytes is None or stream_sample_rate is None:
+        if (
+            first_audio_bytes is None
+            or stream_sample_rate is None
+            or stream_channels is None
+        ):
             raise RuntimeError("No audio output generated from the pipeline.")
         elif stream_sample_rate <= 0:
             raise ValueError("Speech stream sample rate must be positive")
@@ -2267,7 +2272,7 @@ async def speech_audio_response(
         active_request = True
         try:
             if stream_format == "audio" and response_format == "wav":
-                yield create_streaming_wav_header(stream_sample_rate)
+                yield create_streaming_wav_header(stream_sample_rate, stream_channels)
             else:
                 pass
             yield first_audio_bytes
@@ -2279,10 +2284,12 @@ async def speech_audio_response(
                 else:
                     pass
 
-                audio_bytes, emitted_samples, sample_rate = speech_pcm_chunk_bytes(
-                    chunk,
-                    emitted_samples=emitted_samples,
-                    speed=speed,
+                audio_bytes, emitted_samples, sample_rate, channels = (
+                    speech_pcm_chunk_bytes(
+                        chunk,
+                        emitted_samples=emitted_samples,
+                        speed=speed,
+                    )
                 )
                 if audio_bytes is None:
                     continue
@@ -2292,6 +2299,11 @@ async def speech_audio_response(
                     raise RuntimeError(
                         "Speech stream sample rate changed from "
                         f"{stream_sample_rate} to {sample_rate}"
+                    )
+                elif channels != stream_channels:
+                    raise RuntimeError(
+                        "Speech stream channel count changed from "
+                        f"{stream_channels} to {channels}"
                     )
                 else:
                     pass
@@ -2318,7 +2330,7 @@ async def speech_audio_response(
     headers = {
         "X-Request-Id": request_id,
         "X-Sample-Rate": str(stream_sample_rate),
-        "X-Channels": "1",
+        "X-Channels": str(stream_channels),
         "X-Bit-Depth": "16",
     }
     if stream_format == "sse":
@@ -2326,6 +2338,7 @@ async def speech_audio_response(
             _body(),
             stream_outcome=stream_outcome,
             sample_rate=stream_sample_rate,
+            channels=stream_channels,
             response_format=response_format,
             enable_speech_sse_named_events=enable_speech_sse_named_events,
             headers=headers,

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+import numpy as np
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -1966,6 +1967,121 @@ def test_speech_stream_headers_use_chunk_sample_rate() -> None:
     assert response.content[44:] == expected
 
 
+@pytest.mark.parametrize("stream_format", ["audio", "sse"])
+@pytest.mark.parametrize("response_format", ["pcm", "wav"])
+@pytest.mark.parametrize("channel_last", [False, True])
+def test_speech_stream_preserves_stereo_and_terminal_tail(
+    stream_format: Literal["audio", "sse"],
+    response_format: Literal["pcm", "wav"],
+    channel_last: bool,
+) -> None:
+    """Streaming averaged stereo channels and must now retain their samples, tail, and duration."""
+    waveform = np.repeat(
+        np.array(
+            [[0.0, 0.25, 0.5, 0.75, 1.0, -1.0], [1.0, 0.75, 0.5, 0.25, 0.0, -0.5]],
+            dtype=np.float32,
+        ),
+        800,
+        axis=1,
+    )
+    chunks = [
+        GenerateChunk(
+            request_id="speech-stereo",
+            modality="audio",
+            audio_data=audio.T if channel_last else audio,
+            sample_rate=48000,
+            finish_reason=finish_reason,
+        )
+        for audio, finish_reason in ((waveform[:, :2400], None), (waveform, "stop"))
+    ]
+    client = TestClient(
+        create_app(ScriptedStreamingSpeechClient(chunks), model_name="heartmoe")
+    )
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "input": "[Instrumental]",
+            "stream": True,
+            "stream_format": stream_format,
+            "response_format": response_format,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["x-channels"] == "2"
+    assert response.headers["x-sample-rate"] == "48000"
+    assert response.headers["x-bit-depth"] == "16"
+    if stream_format == "sse":
+        events = parse_speech_sse_events(response.text, False)
+        assert events[-1]["type"] == "speech.audio.done"
+        assert events[-1]["duration"] == pytest.approx(0.1)
+        audio_bytes = b"".join(
+            base64.b64decode(event["audio"]) for event in events[:-1]
+        )
+    else:
+        audio_bytes = response.content
+        outcome = client.get(
+            f"/v1/audio/speech/{response.headers['x-request-id']}"
+        ).json()
+        assert outcome["finish_reason"] == "stop"
+    if response_format == "wav":
+        assert audio_bytes[:4] == b"RIFF"
+        assert struct.unpack("<HHIIHH", audio_bytes[20:36]) == (
+            1,
+            2,
+            48000,
+            192000,
+            4,
+            16,
+        )
+        audio_bytes = audio_bytes[44:]
+    else:
+        pass
+    expected_frames = [
+        (0, 32767),
+        (8191, 24575),
+        (16383, 16383),
+        (24575, 8191),
+        (32767, 0),
+        (-32767, -16383),
+    ]
+    assert audio_bytes == b"".join(
+        struct.pack("<hh", *frame) * 800 for frame in expected_frames
+    )
+
+
+def test_speech_sse_rejects_channel_changes_after_audio() -> None:
+    """A stream cannot send mono samples after advertising stereo in its headers."""
+    speech_client = ScriptedStreamingSpeechClient(
+        [
+            GenerateChunk(
+                request_id="changing-channels",
+                audio_data=[[0.1] * 8, [-0.2] * 8],
+                sample_rate=48000,
+            ),
+            GenerateChunk(
+                request_id="changing-channels", audio_data=[0.3] * 8, sample_rate=48000
+            ),
+        ]
+    )
+    client = TestClient(create_app(speech_client, model_name="tts"))
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "hello", "stream_format": "sse", "response_format": "pcm"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-channels"] == "2"
+    events = parse_speech_sse_events(response.text, False)
+    assert [event["type"] for event in events] == ["speech.audio.delta", "error"]
+    assert (
+        events[-1]["error"]["message"]
+        == "Speech stream channel count changed from 2 to 1"
+    )
+    assert events[-1]["error"]["partial_audio"] is True
+    assert events[-1]["error"]["action"] == "discard"
+    assert speech_client.closed
+    assert len(speech_client.aborted) == 1
+
+
 @pytest.mark.parametrize("response_format", ["wav", "pcm"])
 def test_speech_stream_records_terminal_state_from_a_later_chunk(
     response_format: Literal["wav", "pcm"],
@@ -2264,6 +2380,7 @@ def test_speech_sse_preserves_audio_and_reports_terminal_usage(
     assert speech_client.aborted == []
 
 
+@pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize(
     ("response_format", "speed", "expected_samples", "expected_duration_seconds"),
     [("wav", 0.25, 19200, 0.8), ("pcm", 4.0, 1200, 0.05)],
@@ -2273,6 +2390,7 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
     speed: float,
     expected_samples: int,
     expected_duration_seconds: float,
+    channels: int,
 ) -> None:
     """SSE duration describes the speed-adjusted PCM and excludes the WAV header."""
     speech_client = ScriptedStreamingSpeechClient(
@@ -2280,7 +2398,9 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
             GenerateChunk(
                 request_id="speech-speed",
                 modality="audio",
-                audio_data=[0.1] * 4800,
+                audio_data=(
+                    [0.1] * 4800 if channels == 1 else [[0.1] * 4800, [-0.2] * 4800]
+                ),
                 sample_rate=24000,
                 finish_reason="stop",
             )
@@ -2300,6 +2420,7 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
 
     assert response.status_code == 200
     assert response.headers["x-sample-rate"] == "24000"
+    assert response.headers["x-channels"] == str(channels)
     events = [
         json.loads(line.removeprefix("data: "))
         for line in response.iter_lines()
@@ -2311,8 +2432,11 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
         audio_bytes = audio_bytes[44:]
     else:
         pass
-    assert len(audio_bytes) == expected_samples * 2
-    assert audio_bytes == encode_pcm([0.1] * expected_samples, 24000)
+    assert len(audio_bytes) == expected_samples * 2 * channels
+    expected_frame = (
+        struct.pack("<h", 3276) if channels == 1 else struct.pack("<hh", 3276, -6553)
+    )
+    assert audio_bytes == expected_frame * expected_samples
     assert events[-1]["type"] == "speech.audio.done"
     assert events[-1]["duration"] == pytest.approx(expected_duration_seconds)
     assert events[-1]["finish_reason"] == "stop"

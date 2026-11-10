@@ -8,6 +8,7 @@ from sglang_omni.client.audio import (
     encode_audio,
     encode_pcm,
     resample_linear,
+    select_audio_delta,
     to_numpy,
 )
 
@@ -89,6 +90,22 @@ def test_encode_pcm():
     expected = np.array([0, 16383, -32767, 32767], dtype=np.int16)
     actual = np.frombuffer(pcm_bytes, dtype=np.int16)
     assert np.array_equal(expected, actual)
+
+
+def test_stream_delta_preserves_single_stereo_frame_and_deduplicates_terminal() -> None:
+    """A one-sample stereo chunk must keep both channels instead of becoming two mono samples."""
+    waveform = np.array([[[0.25], [-0.5]]], dtype=np.float32)
+    audio, emitted_samples = select_audio_delta(
+        waveform, emitted_samples=0, is_terminal=False, keep_channels=True
+    )
+    assert audio.shape == (2, 1)
+    assert emitted_samples == 1
+    np.testing.assert_array_equal(audio, waveform[0])
+    duplicate, emitted_samples = select_audio_delta(
+        waveform, emitted_samples=emitted_samples, is_terminal=True, keep_channels=True
+    )
+    assert duplicate is None
+    assert emitted_samples == 1
 
 
 def test_resample_linear_preserves_stereo_channels():

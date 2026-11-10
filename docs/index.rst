@@ -188,6 +188,7 @@ Community & Resources
    cookbook/companies/autoark_ai.md
    cookbook/companies/mistral_ai.md
    cookbook/companies/dots_studio.md
+   cookbook/heartmoe.md
 
 .. toctree::
    :hidden:

@@ -59,6 +59,43 @@ def test_speech_generation_uses_served_model_and_default_voice() -> None:
     assert generate_request.metadata["tts_params"]["voice"] == "default"
 
 
+@pytest.mark.parametrize("task_type", ["Cover", "cover"])
+def test_cover_preserves_abc_without_loading_audio(task_type: str) -> None:
+    """Cover score text must reach the model unchanged through every prompt-building path."""
+    service = SpeechRequestValidator(default_model="heartmoe")
+    score = "X:1\nM:4/4\nL:1/4\nK:C\nC D E G | G E D C |]\n"
+    prepared = service.parse_generation_request(
+        {"input": "[Instrumental]", "task_type": task_type, "ref_audio": score}
+    )
+    assert prepared.reference_descriptors == []
+    assert prepared.request.task_type == "Cover"
+    assert prepared.request.ref_audio == score
+    for generated in (
+        service.build_generate_request(prepared.request),
+        service.build_generate_request(prepared.request, validate=False),
+        service.build_generate_request(
+            prepared.request, validate=False, reference_descriptors=[]
+        ),
+    ):
+        assert generated.prompt == "[Instrumental]"
+        assert generated.metadata["tts_params"]["ref_audio"] == score
+        assert generated.metadata["tts_params"]["task_type"] == "Cover"
+
+
+@pytest.mark.parametrize(
+    "reference_fields", [{}, {"ref_audio": None}, {"ref_audio": " \n"}]
+)
+def test_cover_requires_nonempty_abc(reference_fields: dict[str, str | None]) -> None:
+    """Missing or empty Cover scores must fail before a request reaches generation."""
+    service = SpeechRequestValidator(default_model="heartmoe")
+    with pytest.raises(SpeechAPIError) as raised:
+        service.parse_generation_request(
+            {"input": "[Instrumental]", "task_type": "Cover", **reference_fields}
+        )
+    assert raised.value.status_code == 400
+    assert raised.value.param == "ref_audio"
+
+
 @pytest.mark.parametrize(
     ("options", "required", "supports"),
     [
