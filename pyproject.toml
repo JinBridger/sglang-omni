@@ -99,6 +99,12 @@ dependencies = [
     # note (yexiaodong): ZONOS2 text normalization pulls Pynini/OpenFst, which
     # has no usable Apple arm64 wheel and is unrelated to the Qwen3-ASR path.
     "nemo_text_processing==1.2.0; sys_platform != 'darwin' or platform_machine != 'arm64'",
+    # SheetSage2
+    "pretty_midi==0.2.11.post0",
+    "mido==1.3.3",
+    "mir_eval==0.8.2",
+    # BS-RoFormer
+    "audio-separator==0.47.0",
 ]
 
 [project.optional-dependencies]

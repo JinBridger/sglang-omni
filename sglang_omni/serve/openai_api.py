@@ -82,6 +82,10 @@ from sglang_omni.proto.admin import AdminResponse
 from sglang_omni.proto.session import SessionLimits
 from sglang_omni.scheduling.types import SpecTokensDetailsDict
 from sglang_omni.serve.diarizations import register_diarizations
+from sglang_omni.serve.music_edit import register_music_edit
+from sglang_omni.serve.music_generation import register_music_generation
+from sglang_omni.serve.music_separation import register_music_separation
+from sglang_omni.serve.music_transcription import register_music_transcription
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -380,6 +384,25 @@ def create_app(
     register_transcriptions(app)
     register_diarizations(app)
     register_translations(app)
+    if "HeartMoEForConditionalGeneration" in app.state.architectures:
+        register_music_generation(app)
+    else:
+        pass
+    if any(
+        architecture in {"SheetSage2Model", "SheetSage2ForConditionalGeneration"}
+        for architecture in app.state.architectures
+    ):
+        register_music_transcription(app)
+    else:
+        pass
+    if "AceStepV4ConditionGenerationModel" in app.state.architectures:
+        register_music_edit(app)
+    else:
+        pass
+    if "BSRoFormer" in app.state.architectures:
+        register_music_separation(app)
+    else:
+        pass
     if enable_realtime or realtime_deployment is not None:
         register_realtime(app)
         register_session_wire(

@@ -177,10 +177,16 @@ def apply_speed(
 
     # Speed up/slow down by changing the effective sample rate
     # Then resample to the original rate
-    new_length = max(int(round(len(audio) / speed)), 1)
-    old_idx = np.arange(len(audio), dtype=np.float64)
-    new_idx = np.linspace(0.0, len(audio) - 1, num=new_length, dtype=np.float64)
-    resampled = np.interp(new_idx, old_idx, audio).astype(np.float32)
+    sample_count = audio.shape[-1]
+    new_length = max(int(round(sample_count / speed)), 1)
+    old_idx = np.arange(sample_count, dtype=np.float64)
+    new_idx = np.linspace(0.0, sample_count - 1, num=new_length, dtype=np.float64)
+    if audio.ndim == 1:
+        resampled = np.interp(new_idx, old_idx, audio).astype(np.float32)
+    else:
+        resampled = np.stack(
+            [np.interp(new_idx, old_idx, channel) for channel in audio]
+        ).astype(np.float32)
     return resampled, sample_rate
 
 

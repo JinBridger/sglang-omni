@@ -1,5 +1,6 @@
 import os
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 
 from transformers import AutoConfig
 
@@ -7,6 +8,10 @@ from sglang_omni.config.patch import ConfigPatchSet
 from sglang_omni.config.resolver import ConfigResolver
 from sglang_omni.config.schema import PipelineConfig
 from sglang_omni.config.sources import patches_from_dotted_cli, sources_from_config_file
+from sglang_omni.models.bs_roformer.config import (
+    CHECKPOINT_FILENAME,
+    BSRoFormerPipelineConfig,
+)
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY, resolve_variant
 from sglang_omni.utils import (
     architecture_from_hf_config,
@@ -23,6 +28,14 @@ from sglang_omni.utils import (
 
 def resolve_config_cls_for_model_path(model_path: str):
     """Resolve a PipelineConfig class from HF config metadata."""
+    separation_checkpoint = Path(model_path) / CHECKPOINT_FILENAME
+    if (
+        separation_checkpoint.is_file()
+        and separation_checkpoint.with_suffix(".yaml").is_file()
+    ):
+        return BSRoFormerPipelineConfig
+    else:
+        pass
     # note (db-ol): a pinned <repo-id>@<revision> spec resolves metadata at
     # the pinned revision without materializing the snapshot. The weights
     # download happens later, when resolve_checkpoint loads a stage.
