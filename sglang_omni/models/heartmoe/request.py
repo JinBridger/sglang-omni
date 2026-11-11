@@ -12,6 +12,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from transformers import PreTrainedTokenizerBase
 
 from sglang_omni.proto.request import StagePayload
+from sglang_omni.sampling.seed import derive_sampling_seed
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import RequestOutput
@@ -24,10 +25,20 @@ AUDIO_PLACEHOLDER = 248074
 CODEBOOK_SIZE = 8192
 FRAMES_PER_SECOND = 12.5
 HeartMoETask = Literal["Direct", "PlanFull", "PlanMelody", "Cover"]
+SYSTEM_PROMPT = "你是音乐生成模型。根据给定条件生成完整歌曲，遵循指定的输出顺序、ABC 类型和模态边界。"
+COVER_SYSTEM_PROMPT = (
+    "这是翻唱任务。用户给出目标风格描述、歌词和一份参考 ABC 乐谱。"
+    "参考乐谱只提供旋律与段落骨架，请保留它的旋律线；乐谱带和弦时，也保留它的和声进行。"
+    "乐谱中的乐器与演唱方式不作为目标，一切听感以目标风格描述为准："
+    "流派、情绪、乐器、人声性别与音色、速度均按风格描述重新演绎，"
+    "调性若风格描述给出则以描述为准，否则沿用乐谱。"
+    "直接输出音频，不生成或改写乐谱。"
+)
 TASK_INSTRUCTIONS: dict[HeartMoETask, str] = {
-    "Direct": "Generate the complete song audio directly, without an ABC score.",
-    "PlanFull": "Write a full ABC score, then generate the complete corresponding song audio.",
-    "PlanMelody": "Write melody-only ABC notation, then generate the complete corresponding song audio.",
+    "Direct": "直接生成完整歌曲的音频，不输出 ABC 乐谱。",
+    "PlanFull": "先输出 full ABC 乐谱，再生成对应的整首音频。",
+    "PlanMelody": "先输出 melody-only ABC 乐谱，再生成对应的整首音频。",
+    "Cover": "Task: Generate music audio using the supplied lead-sheet ABC score (vocal melody and chords).",
 }
 RESERVED_MARKERS = (
     "<|im_start|>",
@@ -51,20 +62,22 @@ class SamplingOptions(BaseModel):
     temperature: float = Field(default=0.8, ge=0)
     top_k: int = Field(default=50, ge=0, le=CODEBOOK_SIZE + 1)
     top_p: float = Field(default=0.95, gt=0, le=1)
+    first_codebook_temperature: float = Field(default=1.2, ge=0)
+    first_codebook_min_p: float = Field(default=0.05, ge=0, le=1)
+    abc_temperature: float | None = Field(default=None, ge=0)
 
 
 @dataclass
 class HeartMoERequest(SGLangARRequestData):
     enforce_request_limits: bool = True
     options: SamplingOptions = field(default_factory=SamplingOptions)
-    uniforms: torch.Tensor | None = None
+    sampling_seed: int = 0
     feedback: torch.Tensor | None = None
     frames: list[torch.Tensor] = field(default_factory=list)
     generated_frames: int = 0
     phase: Literal["abc", "audio_start", "audio"] = "audio"
     abc_token_ids: list[int] = field(default_factory=list)
     max_abc_tokens: int = 0
-    abc_uniforms: torch.Tensor | None = None
 
 
 def render_prompt(lyrics: str, style: str, task_type: HeartMoETask = "PlanFull") -> str:
@@ -74,11 +87,10 @@ def render_prompt(lyrics: str, style: str, task_type: HeartMoETask = "PlanFull")
         raise ValueError("HeartMoE lyrics and instructions contain a reserved marker")
     else:
         pass
-    task_type = "PlanFull" if task_type == "Cover" else task_type
+    system_prompt = COVER_SYSTEM_PROMPT if task_type == "Cover" else SYSTEM_PROMPT
     style_prompt = f"<|style_start|>{style}<|style_end|>\n" if style.strip() else ""
     return (
-        "<|im_start|>system\nGenerate complete songs from the supplied conditions. "
-        "Follow the requested output order, ABC type and modality boundaries.<|im_end|>\n"
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{TASK_INSTRUCTIONS[task_type]}\n"
         f"{style_prompt}<|lyrics_start|>{lyrics}<|lyrics_end|>\n"
         "<|im_end|>\n<|im_start|>assistant\n"
@@ -107,6 +119,21 @@ def build_request(
     }
     if speech.get("seed") is not None:
         sampling["seed"] = speech["seed"]
+    else:
+        pass
+    stage_parameters = payload.request.params.get("stage_params", {})
+    if not isinstance(stage_parameters, dict):
+        raise ValueError("HeartMoE stage_params must be an object")
+    else:
+        overrides = stage_parameters.get("heartmoe_ar", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("HeartMoE stage_params.heartmoe_ar must be an object")
+    else:
+        sampling.update(
+            {name: value for name, value in overrides.items() if value is not None}
+        )
+    if "temperature" in sampling:
+        sampling.setdefault("first_codebook_temperature", sampling["temperature"])
     else:
         pass
     options = SamplingOptions.model_validate(sampling)
@@ -173,6 +200,7 @@ def build_request(
         req=request,
         stage_payload=payload,
         options=options,
+        sampling_seed=derive_sampling_seed("heartmoe", options.seed),
         input_ids=torch.tensor([prompt_ids]),
         output_ids=request.output_ids,
         max_new_tokens=generation_tokens,

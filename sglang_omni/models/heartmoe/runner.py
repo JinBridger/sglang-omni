@@ -10,7 +10,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
-from sglang_omni.models.heartmoe.local import FrameDecoder, sample_codes
+from sglang_omni.models.heartmoe.local import FrameDecoder
 from sglang_omni.models.heartmoe.model import HeartMoEModel
 from sglang_omni.models.heartmoe.request import (
     ABC_END,
@@ -20,6 +20,7 @@ from sglang_omni.models.heartmoe.request import (
     CODEBOOK_SIZE,
     HeartMoERequest,
 )
+from sglang_omni.models.heartmoe.sampling import MASK_LOGIT_OFFSET, sample_codes
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import SchedulerRequest
 
@@ -59,18 +60,6 @@ class HeartMoERunner(ModelRunner[HeartMoERequest]):
     ) -> None:
         for request in requests:
             state: HeartMoERequest = request.data
-            generator = torch.Generator(device=self.device).manual_seed(
-                state.options.seed
-            )
-            state.abc_uniforms = torch.rand(
-                state.max_abc_tokens, generator=generator, device=self.device
-            )
-            state.uniforms = torch.rand(
-                state.options.max_new_tokens,
-                8,
-                generator=generator,
-                device=self.device,
-            )
             state.feedback = torch.zeros_like(self.model.feedback[0])
 
     def before_decode(
@@ -141,17 +130,25 @@ class HeartMoERunner(ModelRunner[HeartMoERequest]):
                 for token_id in self.model.audio_config["special_token_ids"]
                 if token_id != ABC_END
             ]
-            logits[:, forbidden_tokens] = -torch.inf
-            uniforms = torch.stack(
-                [
-                    states[index].abc_uniforms[len(states[index].abc_token_ids)]
-                    for index in abc_indices
-                ]
+            logits[:, forbidden_tokens] = (
+                logits.amax(dim=-1, keepdim=True) - MASK_LOGIT_OFFSET
+            )
+            sampling_seeds = torch.tensor(
+                [states[index].sampling_seed for index in abc_indices],
+                device=hidden_states.device,
+            )
+            positions = torch.tensor(
+                [len(states[index].abc_token_ids) for index in abc_indices],
+                device=hidden_states.device,
             )
             sampling = torch.tensor(
                 [
                     [
-                        self.abc_temperature,
+                        (
+                            self.abc_temperature
+                            if states[index].options.abc_temperature is None
+                            else states[index].options.abc_temperature
+                        ),
                         states[index].options.top_k,
                         states[index].options.top_p,
                     ]
@@ -159,7 +156,9 @@ class HeartMoERunner(ModelRunner[HeartMoERequest]):
                 ],
                 device=hidden_states.device,
             )
-            token_ids = sample_codes(logits, uniforms, sampling)
+            token_ids = sample_codes(
+                self.decoder.sampler, logits, sampling_seeds, positions, sampling
+            )
             result.next_token_ids[abc_indices] = token_ids
             for index, token_id in zip(abc_indices, token_ids.tolist(), strict=True):
                 state = states[index]
@@ -182,15 +181,22 @@ class HeartMoERunner(ModelRunner[HeartMoERequest]):
             state.req.sampling_params.max_new_tokens = state.max_new_tokens
 
         if audio_indices:
-            uniforms = torch.stack(
+            sampling_seeds = torch.tensor(
+                [states[index].sampling_seed for index in audio_indices],
+                device=hidden_states.device,
+            )
+            positions = torch.tensor(
                 [
-                    states[index].uniforms[states[index].generated_frames]
+                    states[index].max_abc_tokens + states[index].generated_frames * 8
                     for index in audio_indices
-                ]
+                ],
+                device=hidden_states.device,
             )
             sampling = torch.tensor(
                 [
                     [
+                        states[index].options.first_codebook_temperature,
+                        states[index].options.first_codebook_min_p,
                         states[index].options.temperature,
                         states[index].options.top_k,
                         states[index].options.top_p,
@@ -200,7 +206,7 @@ class HeartMoERunner(ModelRunner[HeartMoERequest]):
                 device=hidden_states.device,
             )
             codes, feedback = self.decoder(
-                hidden_states[audio_indices], uniforms, sampling
+                hidden_states[audio_indices], sampling_seeds, positions, sampling
             )
             stopped = codes[:, 0] == CODEBOOK_SIZE
             result.next_token_ids[audio_indices] = torch.where(

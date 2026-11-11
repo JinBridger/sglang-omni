@@ -5,8 +5,12 @@ import math
 from typing import TypedDict
 
 import torch
+from sglang.srt.layers.sampler import create_sampler
 from torch import nn
 from torch.nn import functional as F
+
+from sglang_omni.models.heartmoe.request import CODEBOOK_SIZE, SamplingOptions
+from sglang_omni.models.heartmoe.sampling import MASK_LOGIT_OFFSET, sample_codes
 
 LocalCache = list[tuple[torch.Tensor, torch.Tensor]]
 
@@ -214,32 +218,12 @@ class AudioModules(nn.Module):
         return torch.cat((self.audio_head(hidden), self.audio_end_head(hidden)), dim=-1)
 
 
-def sample_codes(
-    logits: torch.Tensor, uniforms: torch.Tensor, sampling: torch.Tensor
-) -> torch.Tensor:
-    temperature, top_k, top_p = sampling.unbind(-1)
-    values, indices = (logits.float() / temperature.clamp_min(1e-5)[:, None]).sort(
-        descending=True
-    )
-    ranks = torch.arange(values.shape[-1], device=values.device)
-    values = values.masked_fill(
-        (top_k[:, None] > 0) & (ranks >= top_k[:, None]), -torch.inf
-    )
-    probabilities = values.softmax(-1)
-    values = values.masked_fill(
-        (probabilities.cumsum(-1) - probabilities) >= top_p[:, None], -torch.inf
-    )
-    cumulative = values.softmax(-1).cumsum(-1)
-    selected = (cumulative < uniforms[:, None]).sum(-1).clamp_max(values.shape[-1] - 1)
-    selected = indices.gather(1, selected[:, None]).squeeze(1)
-    return torch.where(temperature == 0, logits.argmax(-1), selected)
-
-
 class FrameDecoder:
     def __init__(
         self, audio: AudioModules, batch_sizes: list[int], use_graph: bool
     ) -> None:
         self.audio = audio
+        self.sampler = create_sampler()
         parameter = audio.audio_head.weight
         self.hidden = torch.zeros(
             max(batch_sizes),
@@ -247,10 +231,21 @@ class FrameDecoder:
             device=parameter.device,
             dtype=parameter.dtype,
         )
-        self.uniforms = torch.full((max(batch_sizes), 8), 0.5, device=parameter.device)
-        self.sampling = torch.tensor([0.8, 50, 0.95], device=parameter.device).repeat(
-            max(batch_sizes), 1
+        self.sampling_seeds = torch.zeros(
+            max(batch_sizes), dtype=torch.long, device=parameter.device
         )
+        self.positions = torch.zeros_like(self.sampling_seeds)
+        defaults = SamplingOptions()
+        self.sampling = torch.tensor(
+            [
+                defaults.first_codebook_temperature,
+                defaults.first_codebook_min_p,
+                defaults.temperature,
+                defaults.top_k,
+                defaults.top_p,
+            ],
+            device=parameter.device,
+        ).repeat(max(batch_sizes), 1)
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.outputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         if use_graph:
@@ -261,14 +256,16 @@ class FrameDecoder:
                     for _ in range(3):
                         self.run(
                             self.hidden[:batch_size],
-                            self.uniforms[:batch_size],
+                            self.sampling_seeds[:batch_size],
+                            self.positions[:batch_size],
                             self.sampling[:batch_size],
                         )
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, stream=stream):
                         self.outputs[batch_size] = self.run(
                             self.hidden[:batch_size],
-                            self.uniforms[:batch_size],
+                            self.sampling_seeds[:batch_size],
+                            self.positions[:batch_size],
                             self.sampling[:batch_size],
                         )
                     self.graphs[batch_size] = graph
@@ -277,17 +274,42 @@ class FrameDecoder:
             pass
 
     def run(
-        self, hidden: torch.Tensor, uniforms: torch.Tensor, sampling: torch.Tensor
+        self,
+        hidden: torch.Tensor,
+        sampling_seeds: torch.Tensor,
+        positions: torch.Tensor,
+        sampling: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = self.audio.audio_logits(hidden).float()
+        maximum_logits = logits.amax(dim=-1, keepdim=True)
+        # note (Codex): Gate unscaled logits and keep the sampler input finite.
+        logits = torch.where(
+            logits >= maximum_logits + sampling[:, 1:2].log(),
+            logits,
+            maximum_logits - MASK_LOGIT_OFFSET,
+        )
+        first_codebook_sampling = torch.stack(
+            (
+                sampling[:, 0],
+                torch.zeros_like(sampling[:, 0]),
+                torch.ones_like(sampling[:, 0]),
+            ),
+            dim=-1,
+        )
         first_code = sample_codes(
-            self.audio.audio_logits(hidden), uniforms[:, 0], sampling
+            self.sampler,
+            logits,
+            sampling_seeds,
+            positions,
+            first_codebook_sampling,
+            apply_top_k_top_p=False,
         )
         codes = [first_code]
         decoder = self.audio.mtp
         values = torch.stack(
             (
                 decoder.input_projection(hidden),
-                decoder.embeddings[0](first_code.clamp_max(8191)),
+                decoder.embeddings[0](first_code.clamp_max(CODEBOOK_SIZE - 1)),
             ),
             dim=1,
         )
@@ -298,21 +320,34 @@ class FrameDecoder:
             else:
                 pass
             last, cache = decoder.run_layers(values, cache)
-            codes.append(sample_codes(head(last), uniforms[:, i + 1], sampling))
+            codes.append(
+                sample_codes(
+                    self.sampler,
+                    head(last),
+                    sampling_seeds,
+                    positions + i + 1,
+                    sampling[:, 2:],
+                )
+            )
         codes = torch.stack(codes, dim=1)
-        return codes, self.audio.audio_input(codes.clamp_max(8191))
+        return codes, self.audio.audio_input(codes.clamp_max(CODEBOOK_SIZE - 1))
 
     @torch.inference_mode()
     def __call__(
-        self, hidden: torch.Tensor, uniforms: torch.Tensor, sampling: torch.Tensor
+        self,
+        hidden: torch.Tensor,
+        sampling_seeds: torch.Tensor,
+        positions: torch.Tensor,
+        sampling: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.graphs:
-            return self.run(hidden, uniforms, sampling)
+            return self.run(hidden, sampling_seeds, positions, sampling)
         else:
             batch_size = hidden.shape[0]
             bucket = next(size for size in self.graphs if size >= batch_size)
             self.hidden[:batch_size].copy_(hidden)
-            self.uniforms[:batch_size].copy_(uniforms)
+            self.sampling_seeds[:batch_size].copy_(sampling_seeds)
+            self.positions[:batch_size].copy_(positions)
             self.sampling[:batch_size].copy_(sampling)
             self.graphs[bucket].replay()
             codes, feedback = self.outputs[bucket]

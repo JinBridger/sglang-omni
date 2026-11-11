@@ -82,6 +82,7 @@ class HeartMoEPipelineConfig(PipelineConfig):
             "top_k",
             "top_p",
             "seed",
+            "stage_params",
         }
     )
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {

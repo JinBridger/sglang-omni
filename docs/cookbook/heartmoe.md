@@ -1,6 +1,6 @@
 # HeartMoE
 
-HeartMoE uses SGLang's Qwen3.5-MoE backbone, a batched eight-codebook local decoder, and a separate HeartCodec process. The AR stage uses OmniScheduler continuous batching: requests can enter and leave between decode steps, including batches that mix ABC planning and audio generation. Both backbone and local decoder support CUDA graphs. This implementation uses English task prompts and supports direct audio generation or ABC planning followed by audio. Tensor parallelism is not implemented.
+HeartMoE uses SGLang's Qwen3.5-MoE backbone, a batched eight-codebook local decoder, and a separate HeartCodec process. The AR stage uses OmniScheduler continuous batching: requests can enter and leave between decode steps, including batches that mix ABC planning and audio generation. Both backbone and local decoder support CUDA graphs. Direct and planning tasks use Chinese system and task prompts; Cover uses a dedicated Chinese system prompt with an English lead-sheet task instruction. Tensor parallelism is not implemented.
 
 ## Setup and serving
 
@@ -78,7 +78,7 @@ curl --no-buffer --fail-with-body http://localhost:8000/v1/audio/speech \
 
 The sample rate is 48 kHz. Non-streaming WAV/FLAC/MP3 retain stereo. HTTP streaming PCM/WAV and SSE preserve HeartCodec's two channels. Streamed PCM is signed 16-bit little-endian, interleaved left/right; read `X-Channels`, `X-Sample-Rate`, and `X-Bit-Depth` from the response instead of assuming mono. WAV headers describe both channels, and SSE duration accounts for both channels. At 48 kHz, stereo PCM uses 192,000 bytes per second. Non-streaming raw PCM retains the existing mono encoding. The SSE stream includes `speech.audio.delta` events and a terminal `speech.audio.done` event.
 
-For `Cover`, put the complete ABC score as raw text in `ref_audio`. This uses the same prompt as `PlanFull`, with the supplied score between the assistant's ABC markers, and starts generation at the audio boundary. Do not supply an audio file, URL, base64 audio, or modality markers in this field. Missing or blank scores are rejected. The score counts as input context, not generated ABC, and is not subject to the ABC generation limit. The score and requested audio must still fit the model's context. All other request requirements and audio sampling settings are the same as `Direct`; the default remains `PlanFull`.
+For `Cover`, put the reference lead-sheet ABC score as raw text in `ref_audio`. Its dedicated prompt asks the model to preserve the melody, section structure, and any chord progression while following `instructions` for genre, mood, instruments, vocal gender and timbre, tempo, and any specified key. Otherwise, it retains the score's key. The supplied score remains between the assistant's ABC markers, and generation starts at the audio boundary without generating or rewriting ABC. Do not supply an audio file, URL, base64 audio, or modality markers in this field. Missing or blank scores are rejected. The score counts as input context, not generated ABC, and is not subject to the ABC generation limit. The score and requested audio must still fit the model's context. All other request requirements and audio sampling settings are the same as `Direct`; the default remains `PlanFull`.
 
 ```bash
 curl --fail-with-body http://localhost:8000/v1/audio/speech \
@@ -98,14 +98,34 @@ curl --fail-with-body http://localhost:8000/v1/audio/speech \
 | `task_type` | `null` | `Direct`, `PlanFull`, `PlanMelody`, or `Cover`; `null` selects `PlanFull` |
 | `ref_audio` | `null` | Required raw ABC score for `Cover`; unsupported for other HeartMoE tasks |
 | `max_new_tokens` | 375 | Audio frame cap, from 1 to 7,500 |
-| `temperature` | 0.8 | Audio codebook sampling; 0 selects greedy decoding |
-| `top_k` | 50 | Candidate count; 0 disables top-k |
-| `top_p` | 0.95 | Nucleus probability |
+| `temperature` | CB0: 1.2; CB1–7: 0.8 | An explicit value overrides both audio temperatures; 0 selects greedy decoding |
+| `top_k` | 50 | Candidate count for CB1–7 and ABC; 0 disables top-k |
+| `top_p` | 0.95 | Nucleus probability for CB1–7 and ABC |
 | `seed` | 20261105 | Per-request sampling seed |
 | `voice` | `default` | Only the default voice is supported |
 | `speed` | 1.0 | Describe tempo in `instructions` |
 
-The local sampler keeps temperature, top-k, top-p, and random draws separate for each request. Fused backbone numerics can still vary with batch size; an identical seed is not a promise of identical samples across different concurrency levels or the old HF implementation.
+All three generation paths use the production SGLang sampler. CB0 first keeps raw logits at least `max(logits) + ln(0.05)`, before applying temperature. Rejected logits become `max(logits) - 10000`, keeping sampler inputs finite. CB0 then samples at temperature 1.2 without top-k or top-p; EOS participates in the same filter as ordinary codes. CB1–7 sample at temperature 0.8, top-k 50, and top-p 0.95. ABC uses temperature 0.7, top-k 50, and top-p 0.95 by default.
+
+For independent per-request settings, use `stage_params.heartmoe_ar`. It accepts `first_codebook_temperature`, `first_codebook_min_p`, `abc_temperature`, and the sampling fields in the table. Stage values override top-level values. An explicit `temperature` sets both audio temperatures unless `first_codebook_temperature` is also supplied; `top_k` and `top_p` never filter CB0. `first_codebook_min_p=0` disables the CB0 gate, and `1` retains only maximum-logit codes. For example:
+
+```json
+{
+  "input": "[Instrumental]",
+  "stage_params": {
+    "heartmoe_ar": {
+      "first_codebook_temperature": 1.2,
+      "first_codebook_min_p": 0.05,
+      "temperature": 0.8,
+      "abc_temperature": 0.7,
+      "top_k": 50,
+      "top_p": 0.95
+    }
+  }
+}
+```
+
+Sampling seeds and positions remain separate for each request and codebook step. Fused backbone numerics can still vary with batch size; an identical seed is not a promise of identical samples across different concurrency levels or the previous sampler.
 
 ## Streaming windows and measurement
 

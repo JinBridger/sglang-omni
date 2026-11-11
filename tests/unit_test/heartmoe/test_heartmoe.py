@@ -15,19 +15,16 @@ from sglang_omni.models.heartmoe.codec_flow import FlowMatching
 from sglang_omni.models.heartmoe.codec_model import HeartCodec, HeartCodecConfig
 from sglang_omni.models.heartmoe.config import ARFactoryArgs
 from sglang_omni.models.heartmoe.engine import HeartMoEEngineBuilder
-from sglang_omni.models.heartmoe.local import (
-    AudioModules,
-    FrameDecoder,
-    LocalDecoder,
-    sample_codes,
-)
+from sglang_omni.models.heartmoe.local import AudioModules, FrameDecoder, LocalDecoder
 from sglang_omni.models.heartmoe.request import (
     FrameStream,
     HeartMoERequest,
     render_prompt,
 )
+from sglang_omni.models.heartmoe.sampling import sample_codes
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import OmniRequest, StagePayload
+from tests.unit_test.fixtures.sampling import production_sampler_context
 
 
 def test_local_cached_decode_matches_full_prefix() -> None:
@@ -59,24 +56,45 @@ def test_local_cached_decode_matches_full_prefix() -> None:
             torch.testing.assert_close(cached, full, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_sampling_rows_are_independent() -> None:
     """Batch admission and row reordering must not change a request's random draw."""
     torch.manual_seed(23)
-    logits = torch.randn(4, 65)
-    uniforms = torch.tensor([0.99, 0.2, 0.8, 0.001])
-    sampling = torch.tensor([[0, 0, 1], [0.8, 8, 0.95], [1.1, 0, 0.7], [0.5, 1, 1]])
-    batched = sample_codes(logits, uniforms, sampling)
-    individual = torch.cat(
-        [
-            sample_codes(logits[i : i + 1], uniforms[i : i + 1], sampling[i : i + 1])
-            for i in range(4)
-        ]
+    logits = torch.randn(4, 65, device="cuda")
+    sampling_seeds = torch.tensor([99, 20, 80, 1], device="cuda")
+    positions = torch.tensor([3, 7, 11, 0], device="cuda")
+    sampling = torch.tensor(
+        [[0, 0, 1], [0.8, 8, 0.95], [1.1, 0, 0.7], [0.5, 1, 1]], device="cuda"
     )
-    assert torch.equal(batched, individual)
-    order = torch.tensor([2, 0, 3, 1])
-    assert torch.equal(
-        sample_codes(logits[order], uniforms[order], sampling[order]), batched[order]
-    )
+    with production_sampler_context() as sampler:
+        batched = sample_codes(
+            sampler, logits.clone(), sampling_seeds, positions, sampling
+        )
+        individual = torch.cat(
+            [
+                sample_codes(
+                    sampler,
+                    logits[i : i + 1].clone(),
+                    sampling_seeds[i : i + 1],
+                    positions[i : i + 1],
+                    sampling[i : i + 1],
+                )
+                for i in range(4)
+            ]
+        )
+        assert torch.equal(batched, individual)
+        order = torch.tensor([2, 0, 3, 1], device="cuda")
+        assert torch.equal(
+            sample_codes(
+                sampler,
+                logits[order],
+                sampling_seeds[order],
+                positions[order],
+                sampling[order],
+            ),
+            batched[order],
+        )
     assert batched[0] == logits[0].argmax()
     assert batched[3] == logits[3].argmax()
 
@@ -109,7 +127,8 @@ def test_prompt_preserves_training_boundaries() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_depth_cuda_graph_matches_eager_with_mixed_sampling() -> None:
+@pytest.mark.parametrize("backend", ["pytorch", "flashinfer"])
+def test_depth_cuda_graph_matches_eager_with_mixed_sampling(backend: str) -> None:
     """Reusing a padded graph must preserve each row's codes and feedback."""
     torch.manual_seed(42)
     audio = (
@@ -134,16 +153,25 @@ def test_depth_cuda_graph_matches_eager_with_mixed_sampling() -> None:
         .cuda()
         .eval()
     )
-    decoder = FrameDecoder(audio, [1, 2, 4], use_graph=True)
-    with torch.inference_mode():
+    with production_sampler_context(backend), torch.inference_mode():
+        decoder = FrameDecoder(audio, [1, 2, 4], use_graph=True)
         for batch_size in (3, 1, 4, 2):
             hidden = torch.randn(batch_size, 32, device="cuda")
-            uniforms = torch.rand(batch_size, 8, device="cuda")
+            sampling_seeds = torch.arange(batch_size, device="cuda") + 17
+            positions = torch.arange(batch_size, device="cuda") * 8 + batch_size
             sampling = torch.tensor(
-                [[0, 0, 1], [0.8, 50, 0.95], [1.0, 8, 0.7], [0.5, 1, 1]], device="cuda"
+                [
+                    [0, 0.05, 0, 0, 1],
+                    [1.2, 0.05, 0.8, 50, 0.95],
+                    [1.0, 0, 1.0, 8, 0.7],
+                    [0.5, 1, 0.5, 1, 1],
+                ],
+                device="cuda",
             )[:batch_size]
-            codes, feedback = decoder(hidden, uniforms, sampling)
-            eager_codes, eager_feedback = decoder.run(hidden, uniforms, sampling)
+            codes, feedback = decoder(hidden, sampling_seeds, positions, sampling)
+            eager_codes, eager_feedback = decoder.run(
+                hidden, sampling_seeds, positions, sampling
+            )
             assert torch.equal(codes, eager_codes)
             torch.testing.assert_close(feedback, eager_feedback)
 
