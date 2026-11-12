@@ -190,6 +190,7 @@ Community & Resources
    cookbook/companies/dots_studio.md
    cookbook/heartmoe.md
    cookbook/mula_edit.md
+   cookbook/bs_roformer.md
 
 .. toctree::
    :hidden:

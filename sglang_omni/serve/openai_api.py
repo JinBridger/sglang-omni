@@ -83,6 +83,7 @@ from sglang_omni.proto.session import SessionLimits
 from sglang_omni.scheduling.types import SpecTokensDetailsDict
 from sglang_omni.serve.diarizations import register_diarizations
 from sglang_omni.serve.music_edit import register_music_edit
+from sglang_omni.serve.music_separation import register_music_separation
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -381,6 +382,7 @@ def create_app(
     register_transcriptions(app)
     register_diarizations(app)
     register_music_edit(app)
+    register_music_separation(app)
     register_translations(app)
     if enable_realtime or realtime_deployment is not None:
         register_realtime(app)

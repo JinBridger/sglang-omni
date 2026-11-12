@@ -8,6 +8,7 @@ import re
 from sglang_omni.admission import QueueFullError
 
 _BAD_REQUEST_MARKERS = (
+    "Music separation request:",
     "Mula edit request:",
     "Unsupported language:",
     "longer than the model's context length",

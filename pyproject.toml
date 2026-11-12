@@ -102,6 +102,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+bs-roformer = [
+    "audio-separator==0.47.0",
+]
+
 qwen3-tts-cutedsl = [
     "nvidia-cutlass-dsl==4.8.0",
 ]
