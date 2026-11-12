@@ -55,11 +55,13 @@ Path("edited.wav").write_bytes(response.content)
 
 The three `symbols` fields are required. Melody events are `[start_seconds, end_seconds, midi_pitch]`, with integer MIDI pitches from 0 through 127. Chord events are `[start_seconds, end_seconds, harte_label]`; examples include `C:maj`, `A:min`, `G:7`, `C:maj/3`, and `N` for no chord. Supported qualities are `maj`, `min`, `dim`, `aug`, `sus2`, `sus4`, `7`, `maj7`, `min7`, `hdim7`, `dim7`, `sus4(b7)`, `maj6`, `min6`, `minmaj7`, and `other`.
 
+Chord parsing follows the training behavior. Unknown qualities, such as `C:maj9` and `E:9`, map to `other` while preserving the root and bass. Labels with unsupported bass degrees, such as `C:maj/8`, or unparseable syntax, such as `H:maj` and `C/E`, are treated as no chord and skipped, as are `N` and `X`.
+
 An empty slot `[]` explicitly supplies no notes. A null slot leaves that condition unknown. With `symbolic_scope="whole"` (the default), the supplied score describes the entire recording. Use `"span"` when only the selected interval's score is available; symbols outside it are hidden. Lyrics are supplied for the whole recording and use the model's 512-token encoding limit; captions and musical metadata share its 256-token prompt limit.
 
 `audio_base64` contains a complete encoded audio file without a data URL prefix. WAV and FLAC are supported by the audio decoder. Mono input is duplicated to stereo, additional channels are discarded, and audio is resampled to 48 kHz. The encoded file limit is 128 MiB. The duration limit defaults to 240 seconds and can be configured with `--edit.factory.max_audio_seconds`, up to 600 seconds. Oversized recordings and edit intervals extending beyond the recording are rejected instead of truncated.
 
-Sampling controls are `steps` (default 32), `guidance_scale` (7), `shift` (3), `seed` (42), and `crossfade_seconds` (1). The seed controls both VAE posterior sampling and diffusion noise. Batch composition can still cause floating-point differences. Successful responses have `Content-Type: audio/wav` and an `X-Request-Id` header. Invalid JSON fields return 422, invalid audio or score contents return 400, and a full queue returns 503. Streaming is not supported by this endpoint.
+Sampling controls are `steps` (default 32), `guidance_scale` (7), `shift` (3), `seed` (42), and `crossfade_seconds` (1). The seed controls both VAE posterior sampling and diffusion noise. Batch composition can still cause floating-point differences. Successful responses have `Content-Type: audio/wav` and an `X-Request-Id` header. Invalid JSON fields return 422, invalid audio or edit intervals extending beyond the recording return 400, and a full queue returns 503. Streaming is not supported by this endpoint.
 
 ## Concurrent requests
 

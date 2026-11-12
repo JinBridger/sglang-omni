@@ -19,24 +19,18 @@ PITCH_HARMONICS = (1, 5, 7, 11, 2, 10, 3, 9, 4, 8, 6)
 
 def parse_chord(label: str) -> tuple[int, int, int] | None:
     """Return root pitch class, quality code, and bass pitch class."""
-    if label in ("N", "X"):
-        return None
-    else:
-        match = CHORD_PATTERN.fullmatch(label.strip())
+    match = CHORD_PATTERN.fullmatch(label.strip())
     if match is None:
-        raise ValueError(f"Mula edit request: Invalid Harte chord label: {label!r}")
+        return None
     else:
         letter, accidentals, quality, bass_accidentals, degree = match.groups()
     root = (
         PITCH_CLASSES[letter] + accidentals.count("#") - accidentals.count("b")
     ) % 12
-    quality = quality or "maj"
-    if quality not in CHORD_QUALITIES:
-        raise ValueError(f"Mula edit request: Unsupported chord quality: {quality!r}")
-    elif degree is None:
+    if degree is None:
         bass = root
     elif int(degree) not in BASS_DEGREES:
-        raise ValueError(f"Mula edit request: Unsupported chord bass degree: {degree}")
+        return None
     else:
         bass = (
             root
@@ -44,6 +38,11 @@ def parse_chord(label: str) -> tuple[int, int, int] | None:
             + bass_accidentals.count("#")
             - bass_accidentals.count("b")
         ) % 12
+    quality = quality or "maj"
+    if quality not in CHORD_QUALITIES:
+        quality = "other"
+    else:
+        pass
     return root, CHORD_QUALITIES.index(quality) + 1, bass
 
 

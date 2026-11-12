@@ -88,9 +88,44 @@ def test_score_preserves_onsets_chord_bass_and_unknown_slots() -> None:
     ]
     assert provided[0, :, 0].all()
     assert not provided[0, :, 1].any()
-    assert parse_chord("N") is None
-    with pytest.raises(ValueError, match="Harte"):
-        parse_chord("C/E")
+
+
+@pytest.mark.parametrize(
+    ("label", "expected_chord"),
+    [
+        ("C:maj9", (0, 16, 0)),
+        ("E:9", (4, 16, 4)),
+        ("F#:maj9/b3", (6, 16, 9)),
+        ("C:maj/8", None),
+        ("C:maj9/8", None),
+        ("H:maj", None),
+        ("C/E", None),
+        (" N ", None),
+        ("X", None),
+        (" C# ", (1, 1, 1)),
+        ("Bb:min/b3", (10, 2, 1)),
+        ("C:maj/13", (0, 1, 9)),
+    ],
+)
+def test_score_accepts_unknown_chord_qualities_and_skips_unparseable_labels(
+    label: str, expected_chord: tuple[int, int, int] | None
+) -> None:
+    """Unknown qualities and unparseable chord labels must not reject an edit."""
+    assert parse_chord(label) == expected_chord
+    request = edit_request(
+        symbols={
+            "vocal_melody": None,
+            "instrumental_melody": None,
+            "chord_progression": [[0.0, 0.04, label]],
+        }
+    )
+    events, provided = score_events(request, 1)
+    if expected_chord is None:
+        assert events.shape == (0, 5)
+    else:
+        root, quality, bass = expected_chord
+        assert events.tolist() == [[0, 2, root, 1, quality], [0, 2, bass, 1, 17]]
+    assert provided.tolist() == [[[False, False, True]]]
 
 
 def test_audio_keeps_partial_last_frame_and_rejects_truncation() -> None:

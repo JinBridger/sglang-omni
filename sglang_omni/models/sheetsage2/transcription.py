@@ -267,9 +267,26 @@ class Transcription:
             )
             for track, track_name in ((0, "vocal"), (1, "instrumental"))
         }
+        beats = exports.rhythm_rows(self.events)
+        file_contents["beat.lab"] = exports.rows_text(beats)
+        intervals = {
+            name: exports.interval_rows(self.events, name, self.duration_seconds)
+            for name in ("chord", "key", "structure")
+        }
+        intervals["chord"] = exports.correct_chord_rows(
+            intervals["chord"], intervals["key"]
+        )
+        intervals["key"] = [
+            [start, end, exports.normalize_key_name(key)]
+            for start, end, key in intervals["key"]
+        ]
+        file_contents.update(
+            {
+                f"{field_name}.lab": exports.rows_text(intervals[field_name])
+                for field_name in ("chord", "key")
+            }
+        )
         try:
-            beats = exports.rhythm_rows(self.events)
-            file_contents["beat.lab"] = exports.rows_text(beats)
             if len(beats) < 2:
                 raise ValueError("At least two decoded beats are required for ABC")
             else:
@@ -288,29 +305,12 @@ class Transcription:
                         previous[3],
                     ]
                 )
-            intervals = {
-                name: exports.interval_rows(self.events, name, self.duration_seconds)
-                for name in ("chord", "key", "structure")
-            }
             if not intervals["key"]:
                 raise ValueError(
                     "No key was decoded; cannot construct a keyed ABC score"
                 )
             else:
                 pass
-            intervals["chord"] = exports.correct_chord_rows(
-                intervals["chord"], intervals["key"]
-            )
-            intervals["key"] = [
-                [start, end, exports.normalize_key_name(key)]
-                for start, end, key in intervals["key"]
-            ]
-            file_contents.update(
-                {
-                    f"{field_name}.lab": exports.rows_text(intervals[field_name])
-                    for field_name in ("chord", "key")
-                }
-            )
             intervals = {
                 name: [
                     [max(beats[0][0], start), min(beats[-1][0], end), value]
@@ -339,8 +339,12 @@ class Transcription:
                 melody_only=self.parameters.melody_only,
             )
         except (ValueError, FileNotFoundError) as error:
-            raise ValueError(f"SheetSage2 could not construct ABC: {error}") from error
-        file_contents["score.abc"] = abc
+            logger.warning(
+                f"SheetSage2 {self.payload.request_id}: could not construct ABC; "
+                f"returning LAB outputs only: {error}"
+            )
+        else:
+            file_contents["score.abc"] = abc
         self.payload.data = {
             "text": json.dumps(file_contents, ensure_ascii=False),
             "finish_reason": self.finish_reason,
