@@ -437,7 +437,16 @@ SUPPORTED_TTS_LANGUAGES = frozenset(
     }
 )
 SUPPORTED_TTS_TASK_TYPES = frozenset(
-    {"Base", "CustomVoice", "VoiceDesign", "Direct", "PlanFull", "PlanMelody", "Cover"}
+    {
+        "Base",
+        "CustomVoice",
+        "VoiceDesign",
+        "Direct",
+        "PlanFull",
+        "PlanMelody",
+        "Cover",
+        "Instrumental",
+    }
 )
 TTS_SPEED_MIN = 0.25
 TTS_SPEED_MAX = 4.0

@@ -43,6 +43,10 @@ from tests.unit_test.fixtures.sampling import production_sampler_context
 
 ABC_SCORE = "X:1\nT:Cover test\nM:4/4\nL:1/4\nQ:1/4=100\nK:C\nC D E G | G E D C |]\n"
 EXPECTED_SYSTEM_PROMPT = "你是音乐生成模型。根据给定条件生成完整歌曲，遵循指定的输出顺序、ABC 类型和模态边界。"
+EXPECTED_INSTRUMENTAL_SYSTEM_PROMPT = (
+    "Generate complete instrumental music (no vocals, no lyrics) from the supplied conditions. "
+    "Follow the requested output order, ABC type and modality boundaries."
+)
 EXPECTED_COVER_SYSTEM_PROMPT = (
     "这是翻唱任务。用户给出目标风格描述、歌词和一份参考 ABC 乐谱。"
     "参考乐谱只提供旋律与段落骨架，请保留它的旋律线；乐谱带和弦时，也保留它的和声进行。"
@@ -250,6 +254,16 @@ def advance(
             "Task: Generate music audio using the supplied lead-sheet ABC score (vocal melody and chords).",
             AUDIO_START,
         ),
+        (
+            "Instrumental",
+            "Write a full ABC score, then generate the complete corresponding instrumental audio.",
+            ABC_START,
+        ),
+        (
+            "instrumental",
+            "Write a full ABC score, then generate the complete corresponding instrumental audio.",
+            ABC_START,
+        ),
     ],
 )
 def test_speech_tasks_select_prompt_and_first_modality(
@@ -259,11 +273,16 @@ def test_speech_tasks_select_prompt_and_first_modality(
     state = speech_request(
         task_type, ref_audio=ABC_SCORE if task_type == "Cover" else None
     )
+    lyrics = "[Instrumental]\n"
     if task_type == "Cover":
         prompt_ids = state.req.origin_input_ids[
             : state.req.origin_input_ids.index(ABC_START)
         ]
         system_prompt = EXPECTED_COVER_SYSTEM_PROMPT
+    elif task_type in ("Instrumental", "instrumental"):
+        prompt_ids = state.req.origin_input_ids[:-1]
+        system_prompt = EXPECTED_INSTRUMENTAL_SYSTEM_PROMPT
+        lyrics = ""
     else:
         prompt_ids = state.req.origin_input_ids[:-1]
         system_prompt = EXPECTED_SYSTEM_PROMPT
@@ -272,10 +291,11 @@ def test_speech_tasks_select_prompt_and_first_modality(
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{instruction}\n"
         "<|style_start|>Jazz piano<|style_end|>\n"
-        "<|lyrics_start|>[Instrumental]\n<|lyrics_end|>\n"
+        f"<|lyrics_start|>{lyrics}<|lyrics_end|>\n"
         "<|im_end|>\n<|im_start|>assistant\n"
     )
     assert state.req.origin_input_ids[-1] == first_token
+    assert state.phase == ("abc" if first_token == ABC_START else "audio")
     assert state.options.max_new_tokens == 3
 
 
@@ -528,7 +548,7 @@ def test_plan_transition_preserves_scheduler_limit(
     assert state.generated_frames == (2 if ends_score else 1)
 
 
-@pytest.mark.parametrize("task_type", ["PlanFull", "PlanMelody"])
+@pytest.mark.parametrize("task_type", ["PlanFull", "PlanMelody", "Instrumental"])
 @pytest.mark.parametrize(
     ("abc_tokens", "ends_score"), [(4096, False), (4096, True), (2, False)]
 )

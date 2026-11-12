@@ -24,8 +24,12 @@ AUDIO_END = 248073
 AUDIO_PLACEHOLDER = 248074
 CODEBOOK_SIZE = 8192
 FRAMES_PER_SECOND = 12.5
-HeartMoETask = Literal["Direct", "PlanFull", "PlanMelody", "Cover"]
+HeartMoETask = Literal["Direct", "PlanFull", "PlanMelody", "Cover", "Instrumental"]
 SYSTEM_PROMPT = "你是音乐生成模型。根据给定条件生成完整歌曲，遵循指定的输出顺序、ABC 类型和模态边界。"
+INSTRUMENTAL_SYSTEM_PROMPT = (
+    "Generate complete instrumental music (no vocals, no lyrics) from the supplied conditions. "
+    "Follow the requested output order, ABC type and modality boundaries."
+)
 COVER_SYSTEM_PROMPT = (
     "这是翻唱任务。用户给出目标风格描述、歌词和一份参考 ABC 乐谱。"
     "参考乐谱只提供旋律与段落骨架，请保留它的旋律线；乐谱带和弦时，也保留它的和声进行。"
@@ -39,6 +43,7 @@ TASK_INSTRUCTIONS: dict[HeartMoETask, str] = {
     "PlanFull": "先输出 full ABC 乐谱，再生成对应的整首音频。",
     "PlanMelody": "先输出 melody-only ABC 乐谱，再生成对应的整首音频。",
     "Cover": "Task: Generate music audio using the supplied lead-sheet ABC score (vocal melody and chords).",
+    "Instrumental": "Write a full ABC score, then generate the complete corresponding instrumental audio.",
 }
 RESERVED_MARKERS = (
     "<|im_start|>",
@@ -87,8 +92,18 @@ def render_prompt(lyrics: str, style: str, task_type: HeartMoETask = "PlanFull")
         raise ValueError("HeartMoE lyrics and instructions contain a reserved marker")
     else:
         pass
-    system_prompt = COVER_SYSTEM_PROMPT if task_type == "Cover" else SYSTEM_PROMPT
-    style_prompt = f"<|style_start|>{style}<|style_end|>\n" if style.strip() else ""
+    if task_type == "Instrumental":
+        system_prompt = INSTRUMENTAL_SYSTEM_PROMPT
+        lyrics = ""
+    elif task_type == "Cover":
+        system_prompt = COVER_SYSTEM_PROMPT
+    else:
+        system_prompt = SYSTEM_PROMPT
+    style_prompt = (
+        f"<|style_start|>{style}<|style_end|>\n"
+        if style.strip() or task_type == "Instrumental"
+        else ""
+    )
     return (
         f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{TASK_INSTRUCTIONS[task_type]}\n"

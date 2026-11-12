@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=0,1 sgl-omni serve \
 
 ## Speech requests
 
-`input` contains lyrics, and `instructions` describes the style. Use `[Instrumental]` for instrumental music. One generated frame represents 0.08 seconds; `max_new_tokens=375` caps audio at 30 seconds. The model can finish earlier on EOS.
+`input` contains lyrics, and `instructions` describes the style. For instrumental music, set `task_type` to `Instrumental` and describe the music in `instructions`. The speech API still requires non-empty `input`; use `[Instrumental]` as a placeholder. This task ignores the input lyrics and always sends an empty lyrics block. One generated frame represents 0.08 seconds; `max_new_tokens=375` caps audio at 30 seconds. The model can finish earlier on EOS.
 
 Select the generation task with `task_type`:
 
@@ -46,13 +46,15 @@ Select the generation task with `task_type`:
 | Omitted, `null`, or `PlanFull` | `plan_audio` | `full` | Full ABC score, then audio |
 | `PlanMelody` | `plan_audio` | `melody` | Melody-only ABC score, then audio |
 | `Cover` | `plan_audio` | `full` | User-supplied full ABC score, then audio |
+| `Instrumental` | `plan_audio` | `full` | Full ABC score, then instrumental audio without vocals or lyrics |
 
-The requests below use `PlanFull` by default. Add `"task_type": "Direct"` for direct audio generation. The speech endpoint returns audio; the ABC score conditions generation internally. Streaming audio begins after planning completes. ABC tokens do not consume the `max_new_tokens` audio frame budget. For `PlanFull` and `PlanMelody`, the server allows at most 4,096 ABC content tokens, reduced when needed to reserve context for the requested audio. If the score reaches that limit without its end marker, the server preserves those tokens, inserts the ABC end marker followed by the audio start marker, and continues generating audio. A model-generated ABC end marker can start audio earlier. Configure a lower ABC limit and the sampling temperature with `--heartmoe_ar.factory.max_abc_tokens` and `--heartmoe_ar.factory.abc_temperature` (defaults: 4096 and 0.7); ABC sampling uses the request's `top_k`, `top_p`, and `seed`.
+The requests below use `Instrumental`. Omit `task_type` to select `PlanFull`, or set it to `Direct` for direct audio generation. The speech endpoint returns audio; the ABC score conditions generation internally. Streaming audio begins after planning completes. ABC tokens do not consume the `max_new_tokens` audio frame budget. For `PlanFull`, `PlanMelody`, and `Instrumental`, the server allows at most 4,096 ABC content tokens, reduced when needed to reserve context for the requested audio. If the score reaches that limit without its end marker, the server preserves those tokens, inserts the ABC end marker followed by the audio start marker, and continues generating audio. A model-generated ABC end marker can start audio earlier. Configure a lower ABC limit and the sampling temperature with `--heartmoe_ar.factory.max_abc_tokens` and `--heartmoe_ar.factory.abc_temperature` (defaults: 4096 and 0.7); ABC sampling uses the request's `top_k`, `top_p`, and `seed`.
 
 ```bash
 curl --fail-with-body http://localhost:8000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
+    "task_type": "Instrumental",
     "input": "[Instrumental]\n",
     "instructions": "Jazz piano, upright bass, brushed drums",
     "max_new_tokens": 375,
@@ -67,6 +69,7 @@ For actual incremental delivery, set `stream=true`; merely streaming the HTTP do
 curl --no-buffer --fail-with-body http://localhost:8000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
+    "task_type": "Instrumental",
     "input": "[Instrumental]\n",
     "instructions": "Jazz piano, upright bass, brushed drums",
     "max_new_tokens": 375,
@@ -95,7 +98,7 @@ curl --fail-with-body http://localhost:8000/v1/audio/speech \
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `task_type` | `null` | `Direct`, `PlanFull`, `PlanMelody`, or `Cover`; `null` selects `PlanFull` |
+| `task_type` | `null` | `Direct`, `PlanFull`, `PlanMelody`, `Cover`, or `Instrumental`; `null` selects `PlanFull` |
 | `ref_audio` | `null` | Required raw ABC score for `Cover`; unsupported for other HeartMoE tasks |
 | `max_new_tokens` | 375 | Audio frame cap, from 1 to 7,500 |
 | `temperature` | CB0: 1.2; CB1–7: 0.8 | An explicit value overrides both audio temperatures; 0 selects greedy decoding |
