@@ -7,10 +7,39 @@ import math
 from dataclasses import dataclass
 
 import torch
+from sglang.kernels.ops.attention.flash_attention_v4_sm120 import flash_attn_varlen_func
 from torch import nn
 from torch.nn import functional as F
 
 from sglang_omni.models.mula_edit.model_config import MulaModelConfig
+
+
+@torch.library.custom_op("sglang_omni::mula_edit_local_attention", mutates_args=())
+def local_attention(
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    window_frames: int,
+) -> torch.Tensor:
+    attended = flash_attn_varlen_func(
+        q=queries.transpose(1, 2),
+        k=keys.transpose(1, 2),
+        v=values.transpose(1, 2),
+        causal=False,
+        window_size=(window_frames, window_frames),
+    )
+    return attended.transpose(1, 2).contiguous()
+
+
+@local_attention.register_fake
+def local_attention_shape(
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    window_frames: int,
+) -> torch.Tensor:
+    """Only queries determine the output shape of the registered attention operator."""
+    return torch.empty(queries.shape, device=queries.device, dtype=queries.dtype)
 
 
 @dataclass(kw_only=True)
@@ -108,6 +137,9 @@ class Attention(nn.Module):
         super().__init__()
         self.head_dimension = config.head_dim
         self.key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.use_native_attention: bool = False
+        self.use_flash_attention: bool = False
+        self.window_frames: int | None = None
         self.q_proj = nn.Linear(
             config.hidden_size,
             config.num_attention_heads * config.head_dim,
@@ -156,11 +188,19 @@ class Attention(nn.Module):
             keys = rotate_hidden(keys, embeddings)
         else:
             pass
-        keys = keys.repeat_interleave(self.key_value_groups, dim=1)
-        values = values.repeat_interleave(self.key_value_groups, dim=1)
-        attended = F.scaled_dot_product_attention(
-            queries, keys, values, attn_mask=mask, dropout_p=0.0, is_causal=False
-        )
+        if self.use_flash_attention:
+            assert self.window_frames is not None
+            attended = local_attention(queries, keys, values, self.window_frames)
+        elif self.use_native_attention and mask is None:
+            attended = F.scaled_dot_product_attention(
+                queries, keys, values, dropout_p=0.0, is_causal=False, enable_gqa=True
+            )
+        else:
+            keys = keys.repeat_interleave(self.key_value_groups, dim=1)
+            values = values.repeat_interleave(self.key_value_groups, dim=1)
+            attended = F.scaled_dot_product_attention(
+                queries, keys, values, attn_mask=mask, dropout_p=0.0, is_causal=False
+            )
         return self.o_proj(attended.transpose(1, 2).contiguous().flatten(2))
 
 
@@ -198,11 +238,11 @@ class DiTLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         embeddings: tuple[torch.Tensor, torch.Tensor],
         timestep_projection: torch.Tensor,
         cross_attention: AttentionKeysValues,
-        cross_attention_mask: torch.Tensor,
+        cross_attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         shift, scale, gate, mlp_shift, mlp_scale, mlp_gate = (
             self.scale_shift_table + timestep_projection
@@ -233,8 +273,10 @@ class TimestepEmbedding(nn.Module):
 
     def forward(self, timestep: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         frequencies = torch.exp(
-            -math.log(10000) * torch.arange(128, dtype=torch.float32) / 128
-        ).to(timestep.device)
+            -math.log(10000)
+            * torch.arange(128, dtype=torch.float32, device=timestep.device)
+            / 128
+        )
         angles = (timestep * 1000)[:, None].float() * frequencies[None]
         embedding = torch.cat((angles.cos(), angles.sin()), dim=-1).to(timestep.dtype)
         embedding = self.linear_2(F.silu(self.linear_1(embedding)))

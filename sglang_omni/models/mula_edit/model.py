@@ -2,10 +2,15 @@
 # Copyright 2025 The ACESTEO Team. All rights reserved.
 """Checkpoint-compatible condition encoders and diffusion transformer."""
 
+import logging
 from pathlib import Path
+from typing import Literal
 
 import torch
 from safetensors import safe_open
+from sglang.kernels.ops.attention.flash_attention_v4 import (
+    is_flash_attention_v4_available,
+)
 from torch import nn
 from torch.nn import functional as F
 
@@ -20,6 +25,8 @@ from sglang_omni.models.mula_edit.layers import (
 )
 from sglang_omni.models.mula_edit.model_config import MulaModelConfig
 from sglang_omni.models.mula_edit.symbols import SymbolicSlotEncoder
+
+logger = logging.getLogger(__name__)
 
 
 def pack_sequences(
@@ -145,6 +152,8 @@ class MulaDiT(nn.Module):
     def __init__(self, config: MulaModelConfig) -> None:
         super().__init__()
         self.config = config
+        self.use_native_attention: bool = False
+        self.use_flash_attention: bool = False
         self.layers = nn.ModuleList(
             [DiTLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -165,6 +174,37 @@ class MulaDiT(nn.Module):
         )
         self.context_null = nn.Embedding(1, 64)
 
+    def configure_attention(self, attention_backend: Literal["auto", "sdpa"]) -> None:
+        device = self.scale_shift_table.device
+        self.use_native_attention = (
+            attention_backend == "auto"
+            and self.scale_shift_table.dtype == torch.bfloat16
+        )
+        self.use_flash_attention = (
+            self.use_native_attention
+            and device.type == "cuda"
+            and self.config.head_dim == 128
+            and torch.cuda.get_device_capability(device)[0] == 12
+            and is_flash_attention_v4_available()
+        )
+        for index, layer in enumerate(self.layers):
+            uses_window = (
+                self.config.use_sliding_window
+                and self.config.layer_types[index] == "sliding_attention"
+            )
+            layer.self_attn.use_native_attention = self.use_native_attention
+            layer.cross_attn.use_native_attention = self.use_native_attention
+            layer.self_attn.use_flash_attention = (
+                self.use_flash_attention and uses_window
+            )
+            layer.self_attn.window_frames = (
+                self.config.sliding_window if uses_window else None
+            )
+        logger.info(
+            f"Music edit attention: native_gqa={self.use_native_attention}, "
+            f"flash_attention_4={self.use_flash_attention}"
+        )
+
     def prepare_cross_attention(
         self, conditions: torch.Tensor
     ) -> list[AttentionKeysValues]:
@@ -179,7 +219,6 @@ class MulaDiT(nn.Module):
         context_latents: torch.Tensor,
         symbols: torch.Tensor,
         timestep: torch.Tensor,
-        frame_lengths: torch.Tensor,
         cross_attention: list[AttentionKeysValues],
     ) -> torch.Tensor:
         frames = noisy_latents.shape[1]
@@ -199,21 +238,21 @@ class MulaDiT(nn.Module):
         embedding = embedding + relative_embedding
         projection = projection + relative_projection
         positions = rotary_embeddings(hidden_states, self.config)
-        patch_lengths = (
-            frame_lengths + self.config.patch_size - 1
-        ) // self.config.patch_size
-        valid = (
-            torch.arange(hidden_states.shape[1], device=hidden_states.device)[None]
-            < patch_lengths[:, None]
+        valid = torch.ones(
+            hidden_states.shape[:2], device=hidden_states.device, dtype=torch.bool
         )
-        full_mask = attention_mask(valid, hidden_states.dtype, None)
-        # note (Codex): An explicit additive mask preserves the trained decoder's SDPA path, including padded condition tokens.
-        cross_attention_mask = hidden_states.new_zeros(
-            1, 1, hidden_states.shape[1], cross_attention[0].keys.shape[2]
-        )
+        if self.use_native_attention:
+            full_mask = None
+            # note (Codex): The checkpoint attends to padded condition tokens as well.
+            cross_attention_mask = None
+        else:
+            full_mask = attention_mask(valid, hidden_states.dtype, None)
+            cross_attention_mask = hidden_states.new_zeros(
+                1, 1, hidden_states.shape[1], cross_attention[0].keys.shape[2]
+            )
         sliding_mask = (
             attention_mask(valid, hidden_states.dtype, self.config.sliding_window)
-            if self.config.use_sliding_window
+            if self.config.use_sliding_window and not self.use_flash_attention
             else full_mask
         )
         for index, layer in enumerate(self.layers):

@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded admission and continuous batching for diffusion edits."""
+"""Bounded FIFO admission and serial diffusion edits."""
 
 import logging
 import queue
 import threading
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
 
 from sglang_omni.admission import QueueFullError
-from sglang_omni.models.mula_edit.audio import SAMPLE_RATE, PreparedEdit, prepare_audio
+from sglang_omni.models.mula_edit.audio import SAMPLE_RATE, prepare_audio
 from sglang_omni.models.mula_edit.protocol import MulaEditRequest
 from sglang_omni.models.mula_edit.runtime import MulaEditRuntime
 from sglang_omni.models.mula_edit.sampling import SamplingState
@@ -35,22 +34,19 @@ class MulaEditScheduler:
     def __init__(
         self,
         runtime: MulaEditRuntime,
-        max_batch_size: int,
         max_queued_requests: int,
         max_audio_seconds: float,
     ) -> None:
-        self.runtime = runtime
-        self.max_batch_size = max_batch_size
-        self.max_queued_requests = max_queued_requests
-        self.max_audio_seconds = max_audio_seconds
+        self.runtime: MulaEditRuntime = runtime
+        self.max_queued_requests: int = max_queued_requests
+        self.max_audio_seconds: float = max_audio_seconds
         self.inbox: queue.Queue[IncomingMessage] = queue.Queue()
         self.outbox: queue.Queue[OutgoingMessage] = queue.Queue()
         self.pending: deque[StagePayload] = deque()
-        self.preparing: dict[str, tuple[StagePayload, Future[PreparedEdit]]] = {}
-        self.active: dict[str, ActiveEdit] = {}
+        self.active: ActiveEdit | None = None
         self.aborted: dict[str, None] = {}
-        self.abort_lock = threading.Lock()
-        self.running = True
+        self.abort_lock: threading.Lock = threading.Lock()
+        self.running: bool = True
 
     def warm_up_serving_thread(self) -> None:
         torch.cuda.set_device(self.runtime.device)
@@ -86,8 +82,8 @@ class MulaEditScheduler:
                 )
             )
         elif (
-            len(self.pending) + len(self.preparing) + len(self.active)
-            >= self.max_batch_size + self.max_queued_requests
+            len(self.pending) + int(self.active is not None)
+            >= 1 + self.max_queued_requests
         ):
             self.outbox.put(
                 OutgoingMessage(message.request_id, "error", data=QueueFullError())
@@ -95,43 +91,21 @@ class MulaEditScheduler:
         else:
             self.pending.append(message.data)
 
-    def settle(self, executor: ThreadPoolExecutor) -> None:
+    def is_cancelled(self, request_id: str) -> bool:
+        with self.abort_lock:
+            return not self.running or request_id in self.aborted
+
+    def settle(self) -> None:
         with self.abort_lock:
             aborted = set(self.aborted)
         self.pending = deque(
             payload for payload in self.pending if payload.request_id not in aborted
         )
-        for request_id in list(self.active):
-            if request_id in aborted:
-                self.active.pop(request_id)
-            else:
-                pass
-        admitted = False
-        for request_id, (payload, future) in list(self.preparing.items()):
-            if request_id in aborted:
-                future.cancel()
-                if future.done():
-                    self.preparing.pop(request_id)
-                else:
-                    pass
-            elif future.done() and not admitted:
-                self.preparing.pop(request_id)
-                try:
-                    prepared = future.result()
-                    self.active[request_id] = ActiveEdit(
-                        payload=payload,
-                        state=self.runtime.begin(prepared),
-                        samples=prepared.samples,
-                    )
-                    admitted = True
-                except Exception as error:
-                    self.emit_error(request_id, error)
-            else:
-                pass
-        while (
-            self.pending
-            and len(self.preparing) + len(self.active) < self.max_batch_size
-        ):
+        if self.active is not None and self.active.payload.request_id in aborted:
+            self.active = None
+        else:
+            pass
+        if self.active is None and self.pending and self.running:
             payload = self.pending.popleft()
             try:
                 if payload.request.metadata.get("task") != "mula_edit":
@@ -140,77 +114,79 @@ class MulaEditScheduler:
                     )
                 else:
                     request = MulaEditRequest.model_validate(payload.request.inputs)
-                self.preparing[payload.request_id] = (
-                    payload,
-                    executor.submit(prepare_audio, request, self.max_audio_seconds),
-                )
+                prepared = prepare_audio(request, self.max_audio_seconds)
+                if self.is_cancelled(payload.request_id):
+                    return
+                else:
+                    self.active = ActiveEdit(
+                        payload=payload,
+                        state=self.runtime.begin(prepared),
+                        samples=prepared.samples,
+                    )
             except Exception as error:
                 self.emit_error(payload.request_id, error)
+        else:
+            pass
 
     def advance(self) -> None:
-        edits = list(self.active.values())
-        try:
-            self.runtime.advance([edit.state for edit in edits])
-        except Exception as error:
-            for edit in edits:
-                self.active.pop(edit.payload.request_id)
-                self.emit_error(edit.payload.request_id, error)
+        edit = self.active
+        assert edit is not None
+        if self.is_cancelled(edit.payload.request_id):
+            self.active = None
             return
-        for edit in edits:
-            if not edit.state.done:
-                continue
+        else:
+            pass
+        try:
+            self.runtime.advance(edit.state)
+            if self.is_cancelled(edit.payload.request_id):
+                self.active = None
+                return
+            elif not edit.state.done:
+                return
             else:
-                self.active.pop(edit.payload.request_id)
-            try:
-                waveform = self.runtime.finish(edit.state, edit.samples).numpy()
-                with self.abort_lock:
-                    aborted = edit.payload.request_id in self.aborted
-                if aborted:
-                    continue
-                else:
-                    pass
-                result = StagePayload(
-                    request_id=edit.payload.request_id,
-                    request=edit.payload.request,
-                    data={
-                        "audio_waveform": waveform.tobytes(),
-                        "audio_waveform_dtype": "float32",
-                        "audio_waveform_shape": list(waveform.shape),
-                        "sample_rate": SAMPLE_RATE,
-                    },
-                )
-                self.outbox.put(
-                    OutgoingMessage(edit.payload.request_id, "result", data=result)
-                )
-            except Exception as error:
-                self.emit_error(edit.payload.request_id, error)
+                self.active = None
+            waveform = self.runtime.finish(edit.state, edit.samples).numpy()
+            if self.is_cancelled(edit.payload.request_id):
+                return
+            else:
+                pass
+            result = StagePayload(
+                request_id=edit.payload.request_id,
+                request=edit.payload.request,
+                data={
+                    "audio_waveform": waveform.tobytes(),
+                    "audio_waveform_dtype": "float32",
+                    "audio_waveform_shape": list(waveform.shape),
+                    "sample_rate": SAMPLE_RATE,
+                },
+            )
+            self.outbox.put(
+                OutgoingMessage(edit.payload.request_id, "result", data=result)
+            )
+        except Exception as error:
+            self.active = None
+            self.emit_error(edit.payload.request_id, error)
 
     def start(self) -> None:
         self.warm_up_serving_thread()
-        with ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="mula-audio"
-        ) as executor:
-            try:
-                while self.running:
-                    while True:
-                        try:
-                            self.receive(self.inbox.get_nowait())
-                        except queue.Empty:
-                            break
-                    self.settle(executor)
-                    if self.active:
-                        self.advance()
-                    else:
-                        try:
-                            self.receive(self.inbox.get(timeout=0.01))
-                        except queue.Empty:
-                            pass
-            finally:
-                for _, future in self.preparing.values():
-                    future.cancel()
-                self.preparing.clear()
-                self.active.clear()
-                self.pending.clear()
+        try:
+            while self.running:
+                while True:
+                    try:
+                        self.receive(self.inbox.get_nowait())
+                    except queue.Empty:
+                        break
+                self.settle()
+                if self.active is not None:
+                    self.advance()
+                else:
+                    try:
+                        self.receive(self.inbox.get(timeout=0.01))
+                    except queue.Empty:
+                        pass
+        finally:
+            self.active = None
+            self.pending.clear()
 
 
 def create_executor(
@@ -218,7 +194,9 @@ def create_executor(
     *,
     checkpoint_dir: str | None,
     dtype: Literal["bfloat16", "float32"],
-    max_batch_size: int,
+    attention_backend: Literal["auto", "sdpa"],
+    enable_torch_compile: bool,
+    enable_cuda_graph: bool,
     max_queued_requests: int,
     max_audio_seconds: float,
     device: str | None = None,
@@ -235,8 +213,12 @@ def create_executor(
     else:
         torch.cuda.set_device(resolved_device)
     runtime = MulaEditRuntime(
-        model_path, checkpoint_dir, resolved_device, getattr(torch, dtype)
+        model_path,
+        checkpoint_dir,
+        resolved_device,
+        getattr(torch, dtype),
+        attention_backend=attention_backend,
+        enable_torch_compile=enable_torch_compile,
+        enable_cuda_graph=enable_cuda_graph,
     )
-    return MulaEditScheduler(
-        runtime, max_batch_size, max_queued_requests, max_audio_seconds
-    )
+    return MulaEditScheduler(runtime, max_queued_requests, max_audio_seconds)

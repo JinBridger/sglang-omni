@@ -10,7 +10,6 @@ The model directory must contain `config.json`, `model.safetensors`, and `silenc
 sgl-omni serve /path/to/v5/checkpoint \
   --model-name mula-edit \
   --edit.factory.checkpoint_dir /path/to/checkpoints \
-  --edit.factory.max_batch_size 4 \
   --edit.factory.max_queued_requests 32 \
   --edit.gpu 5 \
   --port 8000
@@ -61,34 +60,27 @@ An empty slot `[]` explicitly supplies no notes. A null slot leaves that conditi
 
 `audio_base64` contains a complete encoded audio file without a data URL prefix. WAV and FLAC are supported by the audio decoder. Mono input is duplicated to stereo, additional channels are discarded, and audio is resampled to 48 kHz. The encoded file limit is 128 MiB. The duration limit defaults to 240 seconds and can be configured with `--edit.factory.max_audio_seconds`, up to 600 seconds. Oversized recordings and edit intervals extending beyond the recording are rejected instead of truncated.
 
-Sampling controls are `steps` (default 32), `guidance_scale` (7), `shift` (3), `seed` (42), and `crossfade_seconds` (1). The seed controls both VAE posterior sampling and diffusion noise. Batch composition can still cause floating-point differences. Successful responses have `Content-Type: audio/wav` and an `X-Request-Id` header. Invalid JSON fields return 422, invalid audio or edit intervals extending beyond the recording return 400, and a full queue returns 503. Streaming is not supported by this endpoint.
+Sampling controls are `steps` (default 32), `guidance_scale` (7), `shift` (3), `seed` (42), and `crossfade_seconds` (1). The seed controls both VAE posterior sampling and diffusion noise. Successful responses have `Content-Type: audio/wav` and an `X-Request-Id` header. Invalid JSON fields return 422, invalid audio or edit intervals extending beyond the recording return 400, and a full queue returns 503. Streaming is not supported by this endpoint.
 
-## Concurrent requests
+## Serial execution and acceleration
 
-The scheduler admits requests between diffusion steps and combines active requests into one DiT forward pass. Each request retains its own diffusion timestep, source latents, symbolic conditions, guidance, and cross-attention cache. Different recording lengths are padded with attention masks so padding cannot affect another recording. Requests leave the batch independently when they finish or are cancelled.
+The scheduler runs one edit at a time in arrival order. Audio preparation, VAE encoding, text conditioning, all diffusion steps, and VAE decoding finish before the next request starts. Additional requests wait in a bounded queue, which defaults to 32 requests; a full queue returns 503. Set `--edit.factory.max_queued_requests 0` to accept only the active request. The former `max_batch_size` option has been removed. Cancellation is checked between diffusion steps and around audio preparation and decoding.
 
-`max_batch_size` counts requests; guidance can require two decoder rows per request. `max_queued_requests` bounds the waiting queue. CPU audio preparation overlaps GPU work. VAE encoding, text conditioning, and VAE decoding run serially in bounded chunks on the same GPU, so these phases can pause diffusion steps for other requests. This initial implementation batches DiT steps and does not batch VAE calls.
+DiT inference enables `torch.compile` and CUDA Graph by default. Compilation uses dynamic shapes and disables Inductor's automatic CUDA Graph capture so the sampler owns graph capture and replay. Each request prepares its symbolic conditions and cross-attention keys and values once. Each diffusion step updates fixed noise and timestep buffers and replays the decoder graph; Euler/APG updates run outside the graph.
 
-The defaults are 4 active requests and 32 queued requests. Four is not a fixed concurrency limit. To allow 16 active requests and another 64 waiting requests, add these launch options:
+The sampler retains one graph for the current audio frame count, guidance branch count, and condition shape. Consecutive requests with the same shape reuse it after replacing all request conditions. A different shape replaces the previous graph. Compilation and capture happen lazily, so the first request and a request requiring a new graph have additional preparation latency. VAE and text encoding remain eager; VAE windows bound their memory use.
+
+With the default `--edit.factory.attention_backend auto`, the BF16 DiT uses mask-free SDPA with native grouped-query attention for full self-attention and cross-attention. On SM12x CUDA devices with FlashAttention-4 available and 128-dimensional heads, local self-attention uses a native symmetric window. Other devices, missing FlashAttention-4, and other head dimensions use the dense SDPA window; float32 keeps the original attention path. Condition encoders retain their padding masks, and the DiT continues to attend to all condition tokens, including padding, as required by the checkpoint. No quantization is applied.
+
+Set `--edit.factory.attention_backend sdpa` to use the original dense-mask attention for comparison or rollback. Attention backends can differ in floating-point rounding; compare musical quality inside the edit interval and around its boundaries when changing backends.
+
+The two optimizations can be disabled independently. To run eager inference, add:
 
 ```bash
-  --edit.factory.max_batch_size 16 \
-  --edit.factory.max_queued_requests 64
+  --edit.factory.enable_torch_compile false \
+  --edit.factory.enable_cuda_graph false
 ```
 
-Increasing the active batch size shares GPU time among more requests; it does not guarantee higher throughput. For whole recordings lasting 1–3 minutes, start with 4 active requests when throughput and latency matter, and use 16 when more requests should advance together. Queue capacity absorbs bursts without increasing the DiT batch size. Longer queues require more host memory for the encoded audio and longer client timeouts.
-
-The DiT processes the entire recording on every diffusion step, even when the edited interval is short. A 120-second recording contains 3,000 latent frames, reduced to 1,500 transformer tokens; classifier-free guidance doubles the decoder rows. Matrix operations, attention, and intermediate tensor reads and writes dominate GPU execution. VAE encoding and decoding add serial work, and mixing recording lengths adds padding up to the longest recording in the batch. Tune concurrency for the longest expected recordings and the chosen guidance and step count.
-
-On an RTX PRO 6000 Blackwell with 96 GB of memory, a warm resident runtime measured the following for synthetic 120-second stereo recordings, 32 diffusion steps, guidance 7, bfloat16, and PyTorch 2.14.1. Each batch was prepared before sampling, and GPU work was synchronized for timing. These are complete batch runtimes including serial VAE encoding, conditioning, and decoding; they exclude CPU input preparation, HTTP transfer, queueing, and WAV serialization. They are not HTTP latency measurements.
-
-| Active requests | Complete batch | DiT time | Requests/minute | Peak allocated GPU memory |
-| --- | --- | --- | --- | --- |
-| 4 | 10.9 s | 7.6 s | 22.0 | 8.4 GiB |
-| 16 | 48.1 s | 34.9 s | 20.0 | 13.0 GiB |
-
-PyTorch reserved 10.5 GiB and 16.4 GiB respectively; CUDA context and library allocations require additional memory. The measurements show spare memory capacity at 16 requests, while DiT execution accounts for roughly 70–73% of runtime. They do not establish the maximum safe concurrency for other recording lengths, dtypes, or GPUs.
-
-A separate local HTTP run submitted 16 concurrent 180-second synthetic recordings with the same sampling settings and an active request limit of 16. All returned valid 48 kHz stereo WAV files with the expected duration. Response times ranged from 54.0 to 76.2 seconds, with a median of 68.2 seconds. This burst test includes request admission, audio processing, and local HTTP transfer; production latency also depends on arrival patterns and audio file sizes.
+The DiT processes the entire recording on every diffusion step, even when the edited interval is short. A 120-second recording contains 3,000 latent frames, reduced to 1,500 transformer tokens. Guidance above 1 evaluates two decoder rows for the single request. Longer recordings and more diffusion steps increase latency; queue capacity only controls how many requests can wait.
 
 The output keeps the source duration after resampling. Outside the selected interval, source latents are restored before decoding. Those samples still pass through the VAE and are not guaranteed to match the original waveform exactly. The result is a single mixed recording, not separate stems.

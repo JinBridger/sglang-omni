@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Music edit contracts, source preservation, and mixed-length batching."""
+"""Music edit contracts, source preservation, and serial execution."""
 
 import base64
 import copy
@@ -14,17 +14,17 @@ import torch
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from sglang_omni.admission import QueueFullError
 from sglang_omni.client.client import Client
 from sglang_omni.models.mula_edit.audio import PreparedEdit, prepare_audio
-from sglang_omni.models.mula_edit.model import MulaDiT
-from sglang_omni.models.mula_edit.model_config import MulaModelConfig
 from sglang_omni.models.mula_edit.protocol import MulaEditRequest
-from sglang_omni.models.mula_edit.sampling import SamplingState, advance_batch
+from sglang_omni.models.mula_edit.sampling import MulaSampler, SamplingState
 from sglang_omni.models.mula_edit.stages import MulaEditScheduler
 from sglang_omni.models.mula_edit.symbols import parse_chord, score_events
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.serve.openai_api import create_app
+from tests.unit_test.fixtures.mula_edit import sampling_state, small_decoder
 
 
 def edit_request(**changes: object) -> MulaEditRequest:
@@ -141,82 +141,55 @@ def test_audio_keeps_partial_last_frame_and_rejects_truncation() -> None:
         prepare_audio(edit_request(audio_base64="not an audio file"), 2)
 
 
-def small_decoder() -> MulaDiT:
-    torch.manual_seed(21)
-    config = MulaModelConfig(
-        hidden_size=32,
-        intermediate_size=48,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        layer_types=["sliding_attention", "full_attention"],
-        sliding_window=2,
-        text_hidden_dim=16,
-        num_lyric_encoder_hidden_layers=1,
-        num_timbre_encoder_hidden_layers=1,
-    )
-    decoder = MulaDiT(config).eval()
-    with torch.no_grad():
-        for name, parameter in decoder.named_parameters():
-            if "norm" in name and name.endswith("weight"):
-                parameter.fill_(1)
-            else:
-                parameter.normal_(0, 0.1)
-    return decoder
-
-
-def sampling_state(
-    decoder: MulaDiT, frames: int, steps: int, guidance: float
-) -> SamplingState:
-    clean = torch.randn(1, frames, 64)
-    noise = torch.randn_like(clean)
-    mask = torch.zeros(1, frames, dtype=torch.bool)
-    mask[:, 1:-1] = True
-    conditions = torch.randn(2 if guidance > 1 else 1, 9, decoder.config.hidden_size)
-    return SamplingState(
-        clean_latents=clean,
-        noise=noise,
-        latents=noise,
-        context_latents=torch.cat(
-            (
-                clean.masked_fill(mask.unsqueeze(-1), 0),
-                mask.unsqueeze(-1).expand_as(clean),
-            ),
-            dim=-1,
-        ),
-        symbols=torch.randn(1, frames, 99),
-        mask=mask,
-        timesteps=torch.linspace(1, 0, steps + 1),
-        cross_attention=decoder.prepare_cross_attention(conditions),
-        guidance_scale=guidance,
-        crossfade_frames=0,
-    )
-
-
+@pytest.mark.parametrize("guidance", [1, 7])
 @torch.inference_mode()
-def test_late_arrival_mixed_lengths_and_guidance_match_serial_sampling() -> None:
+def test_serial_sampling_restores_source_outside_edit(guidance: float) -> None:
     decoder = small_decoder()
-    first = sampling_state(decoder, frames=9, steps=4, guidance=7)
-    second = sampling_state(decoder, frames=16, steps=2, guidance=1)
-    serial = copy.deepcopy([first, second])
-    for state in serial:
+    sampler = MulaSampler(decoder, enable_torch_compile=False, enable_cuda_graph=False)
+    state = sampling_state(decoder, frames=9, steps=4, guidance=guidance)
+    sampler.prepare(state)
+    while not state.done:
+        sampler.advance(state)
+    torch.testing.assert_close(
+        state.latents[~state.mask], state.clean_latents[~state.mask], rtol=0, atol=0
+    )
+    assert torch.isfinite(state.latents).all()
+    assert not torch.equal(state.latents[state.mask], state.clean_latents[state.mask])
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("enable_torch_compile", "enable_cuda_graph"),
+    [(True, False), (False, True), (True, True)],
+)
+@torch.inference_mode()
+def test_accelerated_sampling_matches_eager_across_requests(
+    enable_torch_compile: bool, enable_cuda_graph: bool, dtype: torch.dtype
+) -> None:
+    torch.compiler.reset()
+    decoder = small_decoder().to(device="cuda", dtype=dtype)
+    eager = MulaSampler(decoder, enable_torch_compile=False, enable_cuda_graph=False)
+    accelerated = MulaSampler(
+        copy.deepcopy(decoder),
+        enable_torch_compile=enable_torch_compile,
+        enable_cuda_graph=enable_cuda_graph,
+    )
+    for frames, guidance in ((9, 7), (9, 7), (16, 1), (16, 7), (9, 7)):
+        state = sampling_state(decoder, frames, steps=3, guidance=guidance)
+        expected = copy.deepcopy(state)
+        eager.prepare(expected)
+        accelerated.prepare(state)
         while not state.done:
-            advance_batch(decoder, [state])
-    advance_batch(decoder, [first])
-    active = [first, second]
-    while active:
-        advance_batch(decoder, active)
-        active = [state for state in active if not state.done]
-    for batched, independent in zip((first, second), serial):
+            eager.advance(expected)
+            accelerated.advance(state)
+            tolerance = 0 if dtype == torch.bfloat16 else 1e-4
+            torch.testing.assert_close(
+                state.latents, expected.latents, rtol=tolerance, atol=tolerance
+            )
         torch.testing.assert_close(
-            batched.latents, independent.latents, rtol=2e-5, atol=2e-5
-        )
-        torch.testing.assert_close(
-            batched.latents[~batched.mask],
-            batched.clean_latents[~batched.mask],
-            rtol=0,
-            atol=0,
+            state.latents[~state.mask], state.clean_latents[~state.mask], rtol=0, atol=0
         )
 
 
@@ -269,68 +242,87 @@ def test_endpoint_delivers_stereo_wav_through_real_client() -> None:
         assert len(coordinator.requests) == 1
 
 
-def test_scheduler_admits_during_sampling_and_cancels_before_execution(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("cancel_active", [False, True])
+def test_scheduler_serializes_requests_and_releases_cancelled_work(
+    monkeypatch: pytest.MonkeyPatch, cancel_active: bool
 ) -> None:
     first_started = threading.Event()
     release_first = threading.Event()
-    second_prepared = threading.Event()
-    batches: list[int] = []
+    operations: list[tuple[str, int]] = []
+    states: dict[int, int] = {}
 
     class Runtime:
         def begin(self, prepared: PreparedEdit) -> SamplingState:
+            operations.append(("begin", prepared.request.seed))
             state = sampling_state(small_decoder(), 4, prepared.request.steps, 1)
+            states[id(state)] = prepared.request.seed
             return state
 
-        def advance(self, states: list[SamplingState]) -> None:
-            if not batches:
+        def advance(self, state: SamplingState) -> None:
+            seed = states[id(state)]
+            operations.append(("advance", seed))
+            if seed == 1 and state.step_index == 0:
                 first_started.set()
                 assert release_first.wait(10)
-            elif len(batches) == 1:
-                assert second_prepared.wait(10)
-            batches.append(len(states))
-            for state in states:
-                state.step_index += 1
+            state.step_index += 1
 
         def finish(self, state: SamplingState, samples: int) -> torch.Tensor:
+            operations.append(("finish", states[id(state)]))
             return torch.zeros(2, samples)
 
-    def prepare(request: MulaEditRequest, max_audio_seconds: float) -> PreparedEdit:
-        prepared = prepare_audio(request, max_audio_seconds)
-        if request.seed == 2:
-            second_prepared.set()
-        return prepared
-
-    def submit(
-        scheduler: MulaEditScheduler, request_id: str, steps: int, seed: int
-    ) -> None:
+    def submit(scheduler: MulaEditScheduler, request_id: str, seed: int) -> None:
         request = OmniRequest(
-            inputs=edit_request(steps=steps, seed=seed).model_dump(mode="json"),
+            inputs=edit_request(steps=3, seed=seed).model_dump(mode="json"),
             metadata={"task": "mula_edit"},
         )
         payload = StagePayload(request_id=request_id, request=request, data=None)
         scheduler.inbox.put(IncomingMessage(request_id, "new_request", data=payload))
 
-    monkeypatch.setattr("sglang_omni.models.mula_edit.stages.prepare_audio", prepare)
-    scheduler = MulaEditScheduler(Runtime(), 2, 2, 2)
+    scheduler = MulaEditScheduler(Runtime(), 1, 2)
     monkeypatch.setattr(scheduler, "warm_up_serving_thread", lambda: None)
     thread = threading.Thread(target=scheduler.start)
     thread.start()
     try:
-        submit(scheduler, "first", 4, 1)
+        submit(scheduler, "first", 1)
         assert first_started.wait(10)
-        submit(scheduler, "second", 2, 2)
         scheduler.abort("cancelled")
-        submit(scheduler, "cancelled", 2, 3)
+        submit(scheduler, "cancelled", 3)
+        submit(scheduler, "second", 2)
+        submit(scheduler, "overflow", 4)
+        if cancel_active:
+            scheduler.abort("first")
         release_first.set()
-        results = [scheduler.outbox.get(timeout=10), scheduler.outbox.get(timeout=10)]
-        assert {result.request_id for result in results} == {"first", "second"}
-        assert all(result.type == "result" for result in results)
-        assert max(batches) == 2
+        results = [
+            scheduler.outbox.get(timeout=10) for _ in range(2 if cancel_active else 3)
+        ]
+        successful = [
+            result.request_id for result in results if result.type == "result"
+        ]
+        assert successful == (
+            ["second", "overflow"] if cancel_active else ["first", "second"]
+        )
+        if cancel_active:
+            assert all(result.type == "result" for result in results)
+        else:
+            [rejected] = [result for result in results if result.type == "error"]
+            assert rejected.request_id == "overflow"
+            assert isinstance(rejected.data, QueueFullError)
+        first_operations = (
+            [("begin", 1), ("advance", 1)]
+            if cancel_active
+            else [("begin", 1), *[("advance", 1)] * 3, ("finish", 1)]
+        )
+        expected_operations = first_operations + [
+            ("begin", 2),
+            *[("advance", 2)] * 3,
+            ("finish", 2),
+        ]
+        if cancel_active:
+            expected_operations += [("begin", 4), *[("advance", 4)] * 3, ("finish", 4)]
+        assert operations == expected_operations
         assert scheduler.outbox.empty()
     finally:
         release_first.set()
-        second_prepared.set()
         scheduler.stop()
         thread.join(timeout=10)
     assert not thread.is_alive()

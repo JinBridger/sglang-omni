@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Resident music model, VAE, and text encoder shared by active edits."""
+"""Resident music model, VAE, and text encoder for serial edits."""
 
 from pathlib import Path
+from typing import Literal
 
 import torch
 from diffusers.models.autoencoders.autoencoder_oobleck import AutoencoderOobleck
@@ -11,7 +12,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Model
 from sglang_omni.models.mula_edit.audio import PreparedEdit, decode_audio, encode_audio
 from sglang_omni.models.mula_edit.model import MulaModel
 from sglang_omni.models.mula_edit.protocol import MulaEditRequest
-from sglang_omni.models.mula_edit.sampling import SamplingState, advance_batch
+from sglang_omni.models.mula_edit.sampling import MulaSampler, SamplingState
 from sglang_omni.models.mula_edit.symbols import FRAMES_PER_SECOND
 
 
@@ -22,10 +23,20 @@ class MulaEditRuntime:
         checkpoint_dir: str,
         device: torch.device,
         dtype: torch.dtype,
+        *,
+        attention_backend: Literal["auto", "sdpa"],
+        enable_torch_compile: bool,
+        enable_cuda_graph: bool,
     ) -> None:
         self.device = device
         self.dtype = dtype
         self.model = MulaModel.load(model_path, device, dtype)
+        self.model.decoder.configure_attention(attention_backend)
+        self.sampler: MulaSampler = MulaSampler(
+            self.model.decoder,
+            enable_torch_compile=enable_torch_compile,
+            enable_cuda_graph=enable_cuda_graph,
+        )
         self.silence = (
             torch.load(
                 Path(model_path) / "silence_latent.pt",
@@ -131,7 +142,7 @@ class MulaEditRuntime:
             1, 0, request.steps + 1, device=self.device, dtype=self.dtype
         )
         timesteps = request.shift * timesteps / (1 + (request.shift - 1) * timesteps)
-        return SamplingState(
+        state = SamplingState(
             clean_latents=clean,
             noise=noise,
             latents=noise,
@@ -143,9 +154,11 @@ class MulaEditRuntime:
             guidance_scale=request.guidance_scale,
             crossfade_frames=int(request.crossfade_seconds * FRAMES_PER_SECOND),
         )
+        self.sampler.prepare(state)
+        return state
 
-    def advance(self, states: list[SamplingState]) -> None:
-        advance_batch(self.model.decoder, states)
+    def advance(self, state: SamplingState) -> None:
+        self.sampler.advance(state)
 
     @torch.inference_mode()
     def finish(self, state: SamplingState, samples: int) -> torch.Tensor:
