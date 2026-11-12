@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Request-local window stitching, grammar state, and ABC export."""
+"""Request-local window stitching, grammar state, and JSON music export."""
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, TypedDict
@@ -255,8 +256,20 @@ class Transcription:
             for note in event["values"].get("melody", ())
             if min(self.duration_seconds, float(note["end_time"])) > event["time"]
         )
+        # note (Codex): LAB outputs preserve decoded timing before notation-only adjustments.
+        file_contents: dict[str, str] = {
+            f"melody_{track_name}.lab": exports.rows_text(
+                [
+                    (start_seconds, end_seconds, pitch)
+                    for start_seconds, end_seconds, pitch, source_track in notes
+                    if source_track == track
+                ]
+            )
+            for track, track_name in ((0, "vocal"), (1, "instrumental"))
+        }
         try:
             beats = exports.rhythm_rows(self.events)
+            file_contents["beat.lab"] = exports.rows_text(beats)
             if len(beats) < 2:
                 raise ValueError("At least two decoded beats are required for ABC")
             else:
@@ -292,6 +305,12 @@ class Transcription:
                 [start, end, exports.normalize_key_name(key)]
                 for start, end, key in intervals["key"]
             ]
+            file_contents.update(
+                {
+                    f"{field_name}.lab": exports.rows_text(intervals[field_name])
+                    for field_name in ("chord", "key")
+                }
+            )
             intervals = {
                 name: [
                     [max(beats[0][0], start), min(beats[-1][0], end), value]
@@ -321,8 +340,9 @@ class Transcription:
             )
         except (ValueError, FileNotFoundError) as error:
             raise ValueError(f"SheetSage2 could not construct ABC: {error}") from error
+        file_contents["score.abc"] = abc
         self.payload.data = {
-            "text": abc,
+            "text": json.dumps(file_contents, ensure_ascii=False),
             "finish_reason": self.finish_reason,
             "usage": {"completion_tokens": self.generated_tokens},
         }

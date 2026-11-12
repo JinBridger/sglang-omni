@@ -189,6 +189,7 @@ Community & Resources
    cookbook/companies/mistral_ai.md
    cookbook/companies/dots_studio.md
    cookbook/heartmoe.md
+   cookbook/mula_edit.md
 
 .. toctree::
    :hidden:
