@@ -31,6 +31,7 @@ def register_music_separation(app: FastAPI) -> None:
         request: Request,
         file: Annotated[UploadFile, File()],
         model: Annotated[str | None, Form()] = None,
+        output_format: Annotated[str, Form(alias="format")] = "wav",
     ) -> Response:
         if "BSRoFormer" not in app.state.architectures:
             raise HTTPException(
@@ -56,7 +57,7 @@ def register_music_separation(app: FastAPI) -> None:
             model=model or app.state.model_name,
             prompt={"audio_bytes": audio_bytes},
             stream=False,
-            metadata={"task": "music_separate"},
+            metadata={"task": "music_separate", "format": output_format},
         )
         result = await complete_speech_to_text_request(
             request,

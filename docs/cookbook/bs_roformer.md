@@ -1,6 +1,6 @@
 # BS-RoFormer
 
-BS-RoFormer separates a recording into vocals and instrumental accompaniment. `POST /v1/music/separate` accepts an uploaded audio file and returns a ZIP containing `vocals.wav` and `instrumental.wav`.
+BS-RoFormer separates a recording into vocals and instrumental accompaniment. `POST /v1/music/separate` accepts an uploaded audio file and returns a ZIP containing `vocals.wav` and `instrumental.wav` by default, or `vocals.flac` and `instrumental.flac` when the optional `format` form field is `flac`.
 
 ## Launch
 
@@ -20,7 +20,7 @@ OMP_NUM_THREADS=4 sgl-omni serve /path/to/BS-RoFormer \
   --port 8000
 ```
 
-The stage requires CUDA. The default precision is bfloat16; `--separate.factory.dtype float32` disables mixed precision. Linear weights remain in the selected precision, and attention uses PyTorch SDPA. The STFT, inverse STFT, normalization weights, rotary frequencies, overlap accumulation, and output files retain float32 precision.
+The stage requires CUDA. The default precision is bfloat16; `--separate.factory.dtype float32` disables mixed precision. Linear weights remain in the selected precision, and attention uses PyTorch SDPA. The STFT, inverse STFT, normalization weights, rotary frequencies, and overlap accumulation retain float32 precision. Output files use float32 WAV by default or 16-bit FLAC when requested.
 
 Compilation is enabled by default for the frequency-band encoder, Transformer blocks, and mask prediction heads. These regions use fixed window shapes so PyTorch can fuse normalization, rotary embeddings, activations, and other tensor operations. Compilation and a warmup forward finish before the worker reports ready. Use `--separate.factory.enable_torch_compile false` to run eagerly.
 
@@ -35,6 +35,8 @@ unzip separated.zip
 ```
 
 The `model` form field is optional. WAV, FLAC, MP3, and OGG inputs supported by libsndfile are accepted. Mono input is duplicated to stereo, and input is resampled to the checkpoint's sample rate, 44.1 kHz for this model. The two WAV files use 32-bit floating-point samples, retain the resampled recording length, and sum back to the input without independent normalization or clipping.
+
+Add `-F 'format=flac'` to return `vocals.flac` and `instrumental.flac` encoded as 16-bit PCM FLAC for smaller downloads. Omitting `format` or supplying any other value preserves the default 32-bit floating-point WAV output. Instrumental audio is still computed as input minus vocals before encoding; FLAC export quantizes each stem to 16-bit PCM.
 
 Successful responses use `Content-Type: application/zip`, `Content-Disposition: attachment; filename="separated.zip"`, and an `X-Request-Id` header. Missing uploads return 422; empty or invalid audio returns 400; unknown model names return 404. Uploads over 128 MiB return 413. The duration limit defaults to 600 seconds and is configurable with `--separate.factory.max_audio_seconds`.
 

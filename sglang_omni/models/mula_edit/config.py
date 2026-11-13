@@ -15,7 +15,7 @@ class MulaEditFactoryArgs(FactoryArgs):
     enable_torch_compile: bool = True
     enable_cuda_graph: bool = True
     max_queued_requests: int = Field(default=32, ge=0)
-    max_audio_seconds: float = Field(default=240, gt=0, le=600)
+    max_audio_seconds: float = Field(default=360, gt=0, le=600)
 
 
 class MulaEditStageConfig(StageConfig):

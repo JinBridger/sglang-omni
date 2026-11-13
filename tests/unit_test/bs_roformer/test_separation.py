@@ -6,6 +6,7 @@ import io
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Literal
 from zipfile import ZipFile
 
 import numpy as np
@@ -249,8 +250,15 @@ def test_scheduler_finishes_requests_in_order_and_skips_cancelled_work(
     assert not thread.is_alive()
 
 
+@pytest.mark.parametrize(
+    ("output_format", "audio_format", "audio_subtype"),
+    [(None, "WAV", "FLOAT"), ("flac", "FLAC", "PCM_16"), ("mp3", "WAV", "FLOAT")],
+)
 def test_endpoint_returns_zip_through_pipeline_client(
     runtime: BSRoFormerRuntime,
+    output_format: str | None,
+    audio_format: Literal["WAV", "FLAC"],
+    audio_subtype: Literal["FLOAT", "PCM_16"],
 ) -> None:
     requests: list[OmniRequest] = []
 
@@ -271,15 +279,49 @@ def test_endpoint_returns_zip_through_pipeline_client(
     application = create_app(
         Client(Coordinator()), model_name="bs-roformer", architectures=["BSRoFormer"]
     )
+    audio_bytes = audio_upload(313)
+    reference = BSRoFormerScheduler(runtime, 1).separate(
+        payload("reference", audio_bytes)
+    )
     with TestClient(application) as client:
         response = client.post(
-            "/v1/music/separate", files={"file": ("music.wav", audio_upload(313))}
+            "/v1/music/separate",
+            files={"file": ("music.wav", audio_bytes)},
+            data={} if output_format is None else {"format": output_format},
         )
         assert response.status_code == 200, response.text
         assert response.headers["content-type"] == "application/zip"
         assert 'filename="separated.zip"' in response.headers["content-disposition"]
-        with ZipFile(io.BytesIO(response.content)) as archive:
-            assert set(archive.namelist()) == {"vocals.wav", "instrumental.wav"}
+        with (
+            ZipFile(io.BytesIO(response.content)) as archive,
+            ZipFile(
+                io.BytesIO(reference.data["media"][0]["data"])
+            ) as reference_archive,
+        ):
+            assert set(archive.namelist()) == {
+                f"vocals.{audio_format.lower()}",
+                f"instrumental.{audio_format.lower()}",
+            }
+            for stem_name in ("vocals", "instrumental"):
+                with sf.SoundFile(
+                    io.BytesIO(archive.read(f"{stem_name}.{audio_format.lower()}"))
+                ) as audio_file:
+                    assert audio_file.format == audio_format
+                    assert audio_file.subtype == audio_subtype
+                    assert audio_file.samplerate == runtime.sample_rate
+                    assert audio_file.channels == 2
+                    assert audio_file.frames == 313
+                    waveform = audio_file.read(dtype="float32")
+                reference_waveform, _ = sf.read(
+                    io.BytesIO(reference_archive.read(f"{stem_name}.wav")),
+                    dtype="float32",
+                )
+                np.testing.assert_allclose(
+                    waveform,
+                    reference_waveform,
+                    rtol=0,
+                    atol=1 / 32768 if output_format == "flac" else 0,
+                )
         for audio_bytes, form, status_code in [
             (b"", {}, 400),
             (b"broken", {}, 400),

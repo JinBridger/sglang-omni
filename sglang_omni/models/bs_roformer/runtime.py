@@ -127,21 +127,29 @@ class Separation:
 
     def export(self, sample_rate: int) -> StagePayload:
         self.vocals.div_(self.weights)
+        audio_format: Literal["FLAC", "WAV"]
+        audio_subtype: Literal["PCM_16", "FLOAT"]
+        if self.payload.request.metadata.get("format") == "flac":
+            audio_format, audio_subtype = "FLAC", "PCM_16"
+        else:
+            audio_format, audio_subtype = "WAV", "FLOAT"
         archive_bytes = io.BytesIO()
         with ZipFile(archive_bytes, "w", compression=ZIP_STORED) as archive:
-            for filename, waveform in (
-                ("vocals.wav", self.vocals),
-                ("instrumental.wav", self.waveform - self.vocals),
+            for stem_name, waveform in (
+                ("vocals", self.vocals),
+                ("instrumental", self.waveform - self.vocals),
             ):
                 audio_bytes = io.BytesIO()
                 sf.write(
                     audio_bytes,
                     waveform.numpy().T,
                     sample_rate,
-                    format="WAV",
-                    subtype="FLOAT",
+                    format=audio_format,
+                    subtype=audio_subtype,
                 )
-                archive.writestr(filename, audio_bytes.getvalue())
+                archive.writestr(
+                    f"{stem_name}.{audio_format.lower()}", audio_bytes.getvalue()
+                )
         return StagePayload(
             request_id=self.payload.request_id,
             request=self.payload.request,
