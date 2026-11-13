@@ -83,7 +83,7 @@ def test_flash_attention_preserves_inclusive_window(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("uses_sliding_window", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @torch.inference_mode()
 def test_auto_attention_without_flash_keeps_decoder_output(
     monkeypatch: pytest.MonkeyPatch, uses_sliding_window: bool, dtype: torch.dtype

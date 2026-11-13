@@ -17,6 +17,8 @@ sgl-omni serve /path/to/v5/checkpoint \
 
 Use the same launch environment as other Omni CUDA models. If a system CUDA installation overrides the virtual environment's cuDNN libraries, launch with `env -u LD_LIBRARY_PATH sgl-omni serve ...`.
 
+For GPUs without native BF16 support, such as NVIDIA T4, add `--edit.factory.dtype fp16` (`float16` is also accepted). This sets the DiT, text encoder, and VAE to FP16. FP16 uses the original SDPA attention path with either attention backend setting. To validate eager inference first, also add `--edit.factory.enable_torch_compile false --edit.factory.enable_cuda_graph false`. The default dtype remains `bfloat16`; `float32` is also supported.
+
 ## Request
 
 All timestamps are seconds from the beginning of the original recording. Supply the desired score directly; this endpoint does not transcribe the source audio or parse ABC notation.

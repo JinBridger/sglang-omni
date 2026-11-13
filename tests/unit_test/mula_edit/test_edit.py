@@ -159,7 +159,7 @@ def test_serial_sampling_restores_source_outside_edit(guidance: float) -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     ("enable_torch_compile", "enable_cuda_graph"),
     [(True, False), (False, True), (True, True)],
