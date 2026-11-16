@@ -118,8 +118,8 @@ class HeartMoEPipelineConfig(PipelineConfig):
             codec.process or codec.name
         ):
             raise ValueError("HeartMoE and HeartCodec require separate processes")
-        elif any(stage.tp_size != 1 for stage in self.stages):
-            raise ValueError("HeartMoE currently supports tp_size=1")
+        elif codec.tp_size != 1:
+            raise ValueError("HeartCodec requires tp_size=1; use process replicas")
         elif codec.factory.overlap_frames >= codec.factory.chunk_frames:
             raise ValueError("HeartCodec overlap_frames must be less than chunk_frames")
         else:

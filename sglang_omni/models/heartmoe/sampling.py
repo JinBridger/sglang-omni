@@ -4,6 +4,7 @@
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 MASK_LOGIT_OFFSET = 1e4
@@ -42,4 +43,10 @@ def sample_codes(
         [[] for _ in range(logits.shape[0])],
         positions,
     )
-    return torch.where(temperature == 0, greedy_codes, selected)
+    selected = torch.where(temperature == 0, greedy_codes, selected)
+    if get_parallel().tp_size > 1:
+        # note (Codex): Every rank must use the same codes for local decoding, feedback, and phase transitions.
+        get_parallel().tp_group.broadcast(selected, src=0)
+    else:
+        pass
+    return selected

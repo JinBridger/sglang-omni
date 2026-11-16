@@ -122,9 +122,7 @@ class HeartMoERunner(ModelRunner[HeartMoERequest]):
                 audio_indices.append(index)
 
         if abc_indices:
-            logits = self.model.lm_head.quant_method.apply(
-                self.model.lm_head, hidden_states[abc_indices], self.model.lm_head.bias
-            )[:, : self.model.audio_config["layout"]["text_vocab_size"]].float()
+            logits = self.model.text_logits(hidden_states[abc_indices])
             forbidden_tokens = [
                 token_id
                 for token_id in self.model.audio_config["special_token_ids"]

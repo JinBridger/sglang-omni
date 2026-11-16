@@ -1,6 +1,6 @@
 # HeartMoE
 
-HeartMoE uses SGLang's Qwen3.5-MoE backbone, a batched eight-codebook local decoder, and a separate HeartCodec process. The AR stage uses OmniScheduler continuous batching: requests can enter and leave between decode steps, including batches that mix ABC planning and audio generation. Both backbone and local decoder support CUDA graphs. Direct and planning tasks use Chinese system and task prompts; Cover uses a dedicated Chinese system prompt with an English lead-sheet task instruction. Tensor parallelism is not implemented.
+HeartMoE uses SGLang's Qwen3.5-MoE backbone, a batched eight-codebook local decoder, and a separate HeartCodec process. The AR stage uses OmniScheduler continuous batching: requests can enter and leave between decode steps, including batches that mix ABC planning and audio generation. Both backbone and local decoder support CUDA graphs. Direct and planning tasks use Chinese system and task prompts; Cover uses a dedicated Chinese system prompt with an English lead-sheet task instruction. The AR backbone supports tensor parallelism; the smaller audio modules are replicated on each TP rank, with synchronized sampling. HeartCodec scales through independent process replicas.
 
 ## Setup and serving
 
@@ -33,6 +33,27 @@ CUDA_VISIBLE_DEVICES=0,1 sgl-omni serve \
   --heartmoe_ar.engine.max_running_requests 8 \
   --heartcodec.gpu 1
 ```
+
+For four 48 GB GPUs, split AR across GPUs 0 and 1 and place one HeartCodec replica on each of GPUs 2 and 3:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 SGLANG_OMNI_STARTUP_TIMEOUT=1800 \
+sgl-omni serve \
+  --model-path /path/to/heartmoe_hf --port 8000 \
+  --mem-fraction-static 0.92 \
+  --heartmoe_ar.tp_size 2 \
+  --heartmoe_ar.gpu '[0,1]' \
+  --heartmoe_ar.engine.max_running_requests 50 \
+  --processes.heartmoe_ar.num_replicas 1 \
+  --processes.heartmoe_ar.replica_devices '[0,1]' \
+  --processes.heartcodec.num_replicas 2 \
+  --processes.heartcodec.replica_devices '[2,3]' \
+  --heartcodec.factory.max_batch_size 8 \
+  --heartcodec.factory.compile_codec true \
+  --heartcodec.factory.use_cuda_graph true
+```
+
+The AR admission limit and available KV cache jointly constrain concurrency; long ABC scores and audio sequences consume more cache. TP can change floating-point rounding, so the same seed does not guarantee identical samples between TP=1 and TP=2.
 
 ## Speech requests
 

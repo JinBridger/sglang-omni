@@ -27,6 +27,7 @@ from sglang_omni.models.heartmoe.request import (
 )
 from sglang_omni.models.heartmoe.runner import HeartMoERunner
 from sglang_omni.proto.request import StagePayload
+from sglang_omni.scheduling.bootstrap import InfrastructureOptions
 from sglang_omni.scheduling.engine_factory import (
     GenerationDefaults,
     SchedulerExtras,
@@ -45,9 +46,29 @@ class HeartMoEEngineBuilder(TtsEngineBuilder[HeartMoERequest]):
     model_name = "heartmoe"
     context_length = 16384
 
-    def __init__(self, max_abc_tokens: int, abc_temperature: float) -> None:
+    def __init__(
+        self,
+        max_abc_tokens: int,
+        abc_temperature: float,
+        *,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        nccl_port: int | None = None,
+    ) -> None:
+        if tp_size < 1 or not 0 <= tp_rank < tp_size:
+            raise ValueError(f"Invalid HeartMoE TP rank {tp_rank} for size {tp_size}")
+        elif tp_size > 1 and nccl_port is None:
+            raise ValueError("HeartMoE TP requires a shared nccl_port")
+        else:
+            pass
         self.max_abc_tokens = max_abc_tokens
         self.abc_temperature = abc_temperature
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.nccl_port = nccl_port
+
+    def infra_kwargs(self) -> InfrastructureOptions:
+        return {"tp_rank": self.tp_rank, "nccl_port": self.nccl_port}
 
     def resolve_checkpoint(self, model_path: str) -> str:
         source = Path(model_path).resolve()
@@ -108,13 +129,14 @@ class HeartMoEEngineBuilder(TtsEngineBuilder[HeartMoERequest]):
         }
 
     def adjust_overrides(self, overrides: dict[str, object]) -> None:
-        if int(overrides.get("tp_size", 1)) != 1:
-            raise ValueError("HeartMoE currently supports tp_size=1")
+        if int(overrides.get("tp_size", self.tp_size)) != self.tp_size:
+            raise ValueError("HeartMoE engine TP size must match the stage TP size")
         else:
             pass
         self.max_running_requests = int(overrides["max_running_requests"])
         self.batch_sizes = build_default_cuda_graph_bs(self.max_running_requests)
         overrides.update(
+            tp_size=self.tp_size,
             cuda_graph_max_bs=self.max_running_requests,
             cuda_graph_bs=self.batch_sizes,
             enable_return_hidden_states=True,
@@ -201,9 +223,18 @@ def create_ar_executor(
     abc_temperature: float,
     gpu_id: int | None = None,
     device: str | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
     server_args_overrides: Mapping[str, object] | None = None,
 ) -> OmniScheduler[HeartMoERequest]:
-    builder = HeartMoEEngineBuilder(max_abc_tokens, abc_temperature)
+    builder = HeartMoEEngineBuilder(
+        max_abc_tokens,
+        abc_temperature,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        nccl_port=nccl_port,
+    )
     scheduler = builder.build(
         model_path,
         gpu_id=gpu_id,
