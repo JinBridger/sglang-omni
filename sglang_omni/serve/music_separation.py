@@ -1,21 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Multipart music uploads with a ZIP response containing two stems."""
+"""Music separation from audio URLs with a ZIP response containing two stems."""
 
 import uuid
-from typing import Annotated
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 
 from sglang_omni.client.types import GenerateRequest
+from sglang_omni.serve.music_audio import download_music_audio, require_music_json
 from sglang_omni.serve.speech_to_text import complete_speech_to_text_request
 
 MAX_AUDIO_BYTES = 128 * 1024 * 1024
 
 
+class MusicSeparationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    music_url: AnyHttpUrl
+    model: str | None = None
+    output_format: str = Field(default="wav", alias="format")
+
+
 def register_music_separation(app: FastAPI) -> None:
     @app.post(
         "/v1/music/separate",
+        dependencies=[Depends(require_music_json)],
         response_class=Response,
         responses={
             200: {
@@ -28,36 +38,28 @@ def register_music_separation(app: FastAPI) -> None:
         },
     )
     async def separate_music(
+        body: MusicSeparationRequest,
         request: Request,
-        file: Annotated[UploadFile, File()],
-        model: Annotated[str | None, Form()] = None,
-        output_format: Annotated[str, Form(alias="format")] = "wav",
     ) -> Response:
         if "BSRoFormer" not in app.state.architectures:
             raise HTTPException(
                 status_code=400, detail="This model does not support music separation"
             )
-        elif model is not None and model != app.state.model_name:
+        elif body.model is not None and body.model != app.state.model_name:
             raise HTTPException(
-                status_code=404, detail=f"Model {model!r} is not served"
+                status_code=404, detail=f"Model {body.model!r} is not served"
             )
         else:
             pass
-        audio_bytes = await file.read(MAX_AUDIO_BYTES + 1)
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
-        elif len(audio_bytes) > MAX_AUDIO_BYTES:
-            raise HTTPException(
-                status_code=413, detail="Uploaded audio exceeds 128 MiB"
-            )
-        else:
-            pass
+        audio_bytes = await download_music_audio(
+            str(body.music_url), max_bytes=MAX_AUDIO_BYTES
+        )
         request_id = f"music-separate-{uuid.uuid4()}"
         generation = GenerateRequest(
-            model=model or app.state.model_name,
+            model=body.model or app.state.model_name,
             prompt={"audio_bytes": audio_bytes},
             stream=False,
-            metadata={"task": "music_separate", "format": output_format},
+            metadata={"task": "music_separate", "format": body.output_format},
         )
         result = await complete_speech_to_text_request(
             request,

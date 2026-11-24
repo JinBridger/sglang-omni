@@ -4,17 +4,19 @@
 import base64
 import uuid
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
 from sglang_omni.client.types import GenerateRequest
-from sglang_omni.models.mula_edit.protocol import MulaEditRequest
+from sglang_omni.models.mula_edit.protocol import MAX_AUDIO_BYTES, MulaEditRequest
+from sglang_omni.serve.music_audio import download_music_audio, require_music_json
 from sglang_omni.serve.speech_to_text import complete_speech_to_text_request
 
 
 def register_music_edit(app: FastAPI) -> None:
     @app.post(
         "/v1/music/edit",
+        dependencies=[Depends(require_music_json)],
         response_class=Response,
         responses={
             200: {
@@ -35,10 +37,16 @@ def register_music_edit(app: FastAPI) -> None:
             )
         else:
             pass
+        audio_bytes = await download_music_audio(
+            str(body.music_url), max_bytes=MAX_AUDIO_BYTES
+        )
         request_id = f"mula-edit-{uuid.uuid4()}"
         generation = GenerateRequest(
             model=body.model or app.state.model_name,
-            prompt=body.model_dump(mode="json"),
+            prompt={
+                "request": body.model_dump(mode="json"),
+                "audio_bytes": audio_bytes,
+            },
             stream=False,
             metadata={"task": "mula_edit"},
         )

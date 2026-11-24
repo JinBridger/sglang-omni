@@ -8,6 +8,8 @@ Provides the following endpoints:
 - POST /v1/audio/speech/batch — Batch text-to-speech synthesis
 - WS   /v1/audio/speech/stream — Stateful TTS WebSocket streaming
 - POST /v1/audio/transcriptions — Speech-to-text transcription
+- POST /v1/music/transcribe  — SheetSage2 music transcription
+- POST /v1/music/generate    — HeartMoE music generation
 - GET  /v1/audio/voices      — List preset and uploaded TTS voices
 - POST /v1/audio/voices      — Upload a persistent TTS reference voice
 - DELETE /v1/audio/voices/{name} — Delete an uploaded TTS voice
@@ -82,8 +84,11 @@ from sglang_omni.proto.admin import AdminResponse
 from sglang_omni.proto.session import SessionLimits
 from sglang_omni.scheduling.types import SpecTokensDetailsDict
 from sglang_omni.serve.diarizations import register_diarizations
+from sglang_omni.serve.music_audio import require_music_json
 from sglang_omni.serve.music_edit import register_music_edit
+from sglang_omni.serve.music_generation import MusicGenerationRequest
 from sglang_omni.serve.music_separation import register_music_separation
+from sglang_omni.serve.music_transcription import register_music_transcription
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -133,7 +138,10 @@ from sglang_omni.serve.speech_limits import (
     MAX_VOICE_UPLOAD_BODY_BYTES,
     MAX_VOICE_UPLOAD_BYTES,
 )
-from sglang_omni.serve.speech_service import SpeechRequestValidator
+from sglang_omni.serve.speech_service import (
+    PreparedSpeechRequest,
+    SpeechRequestValidator,
+)
 from sglang_omni.serve.speech_stream_outcomes import SpeechStreamOutcomes
 from sglang_omni.serve.speech_streaming import (
     create_speech_sse_response,
@@ -379,7 +387,13 @@ def create_app(
     register_speech(app)
     register_speech_batch(app)
     register_speech_ws(app)
-    register_transcriptions(app)
+    if any(
+        architecture in {"SheetSage2Model", "SheetSage2ForConditionalGeneration"}
+        for architecture in app.state.architectures
+    ):
+        register_music_transcription(app)
+    else:
+        register_transcriptions(app)
     register_diarizations(app)
     register_music_edit(app)
     register_music_separation(app)
@@ -1918,64 +1932,80 @@ def speech_generation_failure_response(
 
 
 def register_speech(app: FastAPI) -> None:
-    @app.post("/v1/audio/speech")
-    async def create_speech(request: Request) -> Response:
-        client: Client = app.state.client
-        speech_service: SpeechRequestValidator = app.state.speech_service
+    if "HeartMoEForConditionalGeneration" in app.state.architectures:
+        endpoint = "/v1/music/generate"
 
-        request_id = f"speech-{uuid.uuid4()}"
-        try:
-            payload = await request.json()
-            prepared = await asyncio.to_thread(
-                speech_service.parse_generation_request, payload
-            )
-            req = prepared.request
-            gen_req = speech_service.build_generate_request(
-                req,
-                validate=False,
-                reference_descriptors=prepared.reference_descriptors,
-                uploaded_voice=prepared.uploaded_voice,
-            )
-        except json.JSONDecodeError:
-            return speech_error_response(
-                bad_request("speech request body must be valid JSON")
-            )
-        except SpeechAPIError as exc:
-            return speech_error_response(exc)
-
-        if req.stream:
+        @app.post(endpoint, dependencies=[Depends(require_music_json)])
+        async def create_music(
+            request: Request, body: MusicGenerationRequest
+        ) -> Response:
+            speech_service: SpeechRequestValidator = app.state.speech_service
             try:
-                return await speech_audio_response(
-                    request=request,
-                    client=client,
-                    gen_req=gen_req,
-                    request_id=request_id,
-                    speed=req.speed,
-                    speech_stream_outcomes=app.state.speech_stream_outcomes,
-                    stream_format=req.stream_format,
-                    response_format="wav" if req.response_format == "wav" else "pcm",
-                    enable_speech_sse_named_events=app.state.enable_speech_sse_named_events,
-                    return_spec_tokens_details=req.return_spec_tokens_details,
+                prepared = await asyncio.to_thread(
+                    body.prepare_generation, speech_service
                 )
-            except ClientError as exc:
-                return speech_generation_failure_response(request_id, exc)
-            except Exception as exc:
-                return speech_generation_failure_response(
-                    request_id,
-                    exc,
-                    unexpected_message="Error preparing speech stream for request %s",
-                )
-        else:
-            pass
+            except SpeechAPIError as error:
+                return speech_error_response(error)
+            return await create_speech_response(request, prepared)
 
+    else:
+        endpoint = "/v1/audio/speech"
+
+        @app.post(endpoint)
+        async def create_speech(request: Request) -> Response:
+            speech_service: SpeechRequestValidator = app.state.speech_service
+            try:
+                payload = await request.json()
+                prepared = await asyncio.to_thread(
+                    speech_service.parse_generation_request, payload
+                )
+            except json.JSONDecodeError:
+                return speech_error_response(
+                    bad_request("speech request body must be valid JSON")
+                )
+            except SpeechAPIError as error:
+                return speech_error_response(error)
+            return await create_speech_response(request, prepared)
+
+    @app.get(f"{endpoint}/{{request_id}}")
+    async def get_speech_stream_outcome(request_id: str) -> JSONResponse:
+        stream_outcome = app.state.speech_stream_outcomes.get(request_id)
+        if stream_outcome is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No finished audio stream with request id {request_id}",
+            )
+        else:
+            return JSONResponse(stream_outcome.model_dump())
+
+
+async def create_speech_response(
+    request: Request, prepared: PreparedSpeechRequest
+) -> Response:
+    app = request.app
+    client: Client = app.state.client
+    speech_service: SpeechRequestValidator = app.state.speech_service
+    request_id = f"speech-{uuid.uuid4()}"
+    req = prepared.request
+    gen_req = speech_service.build_generate_request(
+        req,
+        validate=False,
+        reference_descriptors=prepared.reference_descriptors,
+        uploaded_voice=prepared.uploaded_voice,
+    )
+    if req.stream:
         try:
-            result = await await_speech_response(
+            return await speech_audio_response(
                 request=request,
                 client=client,
                 gen_req=gen_req,
                 request_id=request_id,
-                response_format=req.response_format,
                 speed=req.speed,
+                speech_stream_outcomes=app.state.speech_stream_outcomes,
+                stream_format=req.stream_format,
+                response_format="wav" if req.response_format == "wav" else "pcm",
+                enable_speech_sse_named_events=app.state.enable_speech_sse_named_events,
+                return_spec_tokens_details=req.return_spec_tokens_details,
             )
         except ClientError as exc:
             return speech_generation_failure_response(request_id, exc)
@@ -1983,83 +2013,88 @@ def register_speech(app: FastAPI) -> None:
             return speech_generation_failure_response(
                 request_id,
                 exc,
-                unexpected_message="Error generating speech for request %s",
+                unexpected_message="Error preparing speech stream for request %s",
             )
+    else:
+        pass
 
-        headers = {
-            "Content-Disposition": f'attachment; filename="speech.{result.format}"',
-            "X-Request-Id": request_id,
-            # note (Junnan Li): the body is binary audio, so the terminal state
-            # travels in the same X- header channel as usage.
-            "X-Finish-Reason": result.finish_reason,
-        }
-        if result.usage is not None:
-            headers.update(
-                {
-                    name: str(tokens)
-                    for name, tokens in (
-                        ("X-Prompt-Tokens", result.usage.prompt_tokens),
-                        ("X-Completion-Tokens", result.usage.completion_tokens),
-                        (
-                            "X-SGLang-Omni-Input-Tokens",
-                            result.usage.prompt_tokens,
-                        ),
-                        (
-                            "X-SGLang-Omni-Output-Tokens",
-                            result.usage.completion_tokens,
-                        ),
-                        ("X-SGLang-Omni-Total-Tokens", result.usage.total_tokens),
-                    )
-                    if tokens is not None
-                }
-            )
-            if result.usage.engine_time_s is not None:
-                headers["X-Engine-Time"] = str(result.usage.engine_time_s)
-            else:
-                pass
-        else:
-            pass
-        if req.return_spec_tokens_details and result.spec_tokens_details is not None:
-            details = result.spec_tokens_details
-            headers.update(
-                {
-                    "X-SGLang-Omni-Spec-Accept-Length": str(
-                        details["spec_accept_length"]
-                    ),
-                    "X-SGLang-Omni-Spec-Num-Correct-Drafts": str(
-                        details["spec_num_correct_drafts"]
-                    ),
-                    "X-SGLang-Omni-Spec-Verify-Ct": str(details["spec_verify_ct"]),
-                }
-            )
-            if "spec_accept_rate" in details:
-                headers["X-SGLang-Omni-Spec-Accept-Rate"] = str(
-                    details["spec_accept_rate"]
-                )
-                headers["X-SGLang-Omni-Spec-Num-Proposed-Drafts"] = str(
-                    details["spec_num_proposed_drafts"]
-                )
-            else:
-                pass
-        else:
-            pass
-
-        return Response(
-            content=result.audio_bytes,
-            media_type=result.mime_type,
-            headers=headers,
+    try:
+        result = await await_speech_response(
+            request=request,
+            client=client,
+            gen_req=gen_req,
+            request_id=request_id,
+            response_format=req.response_format,
+            speed=req.speed,
+        )
+    except ClientError as exc:
+        return speech_generation_failure_response(request_id, exc)
+    except Exception as exc:
+        return speech_generation_failure_response(
+            request_id,
+            exc,
+            unexpected_message="Error generating speech for request %s",
         )
 
-    @app.get("/v1/audio/speech/{request_id}")
-    async def get_speech_stream_outcome(request_id: str) -> JSONResponse:
-        stream_outcome = app.state.speech_stream_outcomes.get(request_id)
-        if stream_outcome is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No finished speech stream with request id {request_id}",
+    headers = {
+        "Content-Disposition": f'attachment; filename="speech.{result.format}"',
+        "X-Request-Id": request_id,
+        # note (Junnan Li): the body is binary audio, so the terminal state
+        # travels in the same X- header channel as usage.
+        "X-Finish-Reason": result.finish_reason,
+    }
+    if result.usage is not None:
+        headers.update(
+            {
+                name: str(tokens)
+                for name, tokens in (
+                    ("X-Prompt-Tokens", result.usage.prompt_tokens),
+                    ("X-Completion-Tokens", result.usage.completion_tokens),
+                    (
+                        "X-SGLang-Omni-Input-Tokens",
+                        result.usage.prompt_tokens,
+                    ),
+                    (
+                        "X-SGLang-Omni-Output-Tokens",
+                        result.usage.completion_tokens,
+                    ),
+                    ("X-SGLang-Omni-Total-Tokens", result.usage.total_tokens),
+                )
+                if tokens is not None
+            }
+        )
+        if result.usage.engine_time_s is not None:
+            headers["X-Engine-Time"] = str(result.usage.engine_time_s)
+        else:
+            pass
+    else:
+        pass
+    if req.return_spec_tokens_details and result.spec_tokens_details is not None:
+        details = result.spec_tokens_details
+        headers.update(
+            {
+                "X-SGLang-Omni-Spec-Accept-Length": str(details["spec_accept_length"]),
+                "X-SGLang-Omni-Spec-Num-Correct-Drafts": str(
+                    details["spec_num_correct_drafts"]
+                ),
+                "X-SGLang-Omni-Spec-Verify-Ct": str(details["spec_verify_ct"]),
+            }
+        )
+        if "spec_accept_rate" in details:
+            headers["X-SGLang-Omni-Spec-Accept-Rate"] = str(details["spec_accept_rate"])
+            headers["X-SGLang-Omni-Spec-Num-Proposed-Drafts"] = str(
+                details["spec_num_proposed_drafts"]
             )
         else:
-            return JSONResponse(stream_outcome.model_dump())
+            pass
+    else:
+        pass
+
+    return Response(
+        content=result.audio_bytes,
+        media_type=result.mime_type,
+        headers=headers,
+    )
 
 
 def register_speech_batch(app: FastAPI) -> None:

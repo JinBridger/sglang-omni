@@ -87,7 +87,7 @@ class HeartMoERequest(SGLangARRequestData):
 
 def render_prompt(lyrics: str, style: str, task_type: HeartMoETask = "PlanFull") -> str:
     if not lyrics.strip():
-        raise ValueError("HeartMoE input must contain lyrics or '[Instrumental]'")
+        raise ValueError("HeartMoE lyrics must contain text or '[Instrumental]'")
     elif any(marker in text for text in (lyrics, style) for marker in RESERVED_MARKERS):
         raise ValueError("HeartMoE lyrics and instructions contain a reserved marker")
     else:
@@ -120,7 +120,7 @@ def build_request(
 ) -> HeartMoERequest:
     speech = payload.request.metadata.get("tts_params")
     if not isinstance(speech, dict) or not isinstance(payload.request.inputs, str):
-        raise ValueError("HeartMoE requires a /v1/audio/speech request")
+        raise ValueError("HeartMoE requires a /v1/music/generate request")
     elif speech.get("voice") not in (None, "", "default"):
         raise ValueError("HeartMoE supports voice='default' only")
     elif speech.get("speed", 1.0) != 1.0:
@@ -159,21 +159,21 @@ def build_request(
         payload.request.inputs, speech.get("instructions") or "", task_type
     )
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-    ref_audio = speech.get("ref_audio")
+    score = speech.get("ref_audio")
     if task_type == "Cover":
-        if not isinstance(ref_audio, str) or not ref_audio.strip():
-            raise ValueError("HeartMoE Cover requires non-empty ABC text in ref_audio")
-        elif any(marker in ref_audio for marker in RESERVED_MARKERS):
-            raise ValueError("HeartMoE Cover ref_audio contains a reserved marker")
+        if not isinstance(score, str) or not score.strip():
+            raise ValueError("HeartMoE Cover requires non-empty ABC text in score")
+        elif any(marker in score for marker in RESERVED_MARKERS):
+            raise ValueError("HeartMoE Cover score contains a reserved marker")
         else:
             prompt_ids += (
                 [ABC_START]
-                + tokenizer.encode(ref_audio, add_special_tokens=False)
+                + tokenizer.encode(score, add_special_tokens=False)
                 + [ABC_END, AUDIO_START]
             )
-            prompt += f"<|music_abc_start|>{ref_audio}<|music_abc_end|>"
-    elif ref_audio is not None:
-        raise ValueError("HeartMoE ref_audio is only supported for task_type='Cover'")
+            prompt += f"<|music_abc_start|>{score}<|music_abc_end|>"
+    elif score is not None:
+        raise ValueError("HeartMoE score is only supported for task_type='Cover'")
     else:
         prompt_ids.append(AUDIO_START if task_type == "Direct" else ABC_START)
     starts_with_audio = task_type in ("Direct", "Cover")

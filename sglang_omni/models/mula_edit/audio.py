@@ -2,8 +2,6 @@
 # Copyright (c) 2026 ACEStep
 """Bounded audio decoding and overlapping VAE encode/decode windows."""
 
-import base64
-import binascii
 import io
 import math
 from dataclasses import dataclass
@@ -35,19 +33,15 @@ class PreparedEdit:
     provided: torch.Tensor
 
 
-def prepare_audio(request: MulaEditRequest, max_audio_seconds: float) -> PreparedEdit:
-    try:
-        encoded = base64.b64decode(request.audio_base64, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError(
-            "Mula edit request: audio_base64 must contain a valid base64 audio file"
-        ) from error
-    if len(encoded) > MAX_AUDIO_BYTES:
+def prepare_audio(
+    request: MulaEditRequest, audio_bytes: bytes, max_audio_seconds: float
+) -> PreparedEdit:
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
         raise ValueError("Mula edit request: Encoded audio exceeds the 128 MiB limit")
     else:
         pass
     try:
-        with sf.SoundFile(io.BytesIO(encoded)) as audio_file:
+        with sf.SoundFile(io.BytesIO(audio_bytes)) as audio_file:
             sample_rate = audio_file.samplerate
             if audio_file.frames / sample_rate > max_audio_seconds:
                 raise ValueError(
@@ -57,7 +51,7 @@ def prepare_audio(request: MulaEditRequest, max_audio_seconds: float) -> Prepare
                 waveform = audio_file.read(dtype="float32", always_2d=True)
     except sf.LibsndfileError as error:
         raise ValueError(
-            "Mula edit request: Could not decode audio_base64 as an audio file"
+            "Mula edit request: Could not decode downloaded audio"
         ) from error
     if waveform.size == 0 or not np.isfinite(waveform).all():
         raise ValueError(

@@ -3,7 +3,7 @@
 
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
 
 CHORD_QUALITIES = (
     "maj",
@@ -53,11 +53,11 @@ class SymbolicScore(BaseModel):
 
 
 class MulaEditRequest(BaseModel):
-    """One edit; audio_base64 contains an encoded audio file, without a data URL prefix."""
+    """One edit of a recording supplied through an HTTP or HTTPS music URL."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     model: str | None = None
-    audio_base64: str = Field(min_length=1, max_length=4 * ((MAX_AUDIO_BYTES + 2) // 3))
+    music_url: AnyHttpUrl
     symbols: SymbolicScore
     lyrics: str = Field(max_length=32768)
     start_seconds: Seconds
@@ -80,3 +80,11 @@ class MulaEditRequest(BaseModel):
         else:
             pass
         return self
+
+
+class MulaEditInput(BaseModel):
+    """An edit request and downloaded audio carried to the model stage."""
+
+    model_config = ConfigDict(extra="forbid")
+    request: MulaEditRequest
+    audio_bytes: bytes = Field(strict=True)

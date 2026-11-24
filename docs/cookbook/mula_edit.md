@@ -1,6 +1,6 @@
 # Mula Edit
 
-Mula Edit regenerates a selected interval of an existing recording using vocal melody, instrumental melody, chords, and lyrics. `POST /v1/music/edit` accepts JSON and returns a 48 kHz stereo WAV file. The implementation loads the v5 checkpoint with the `AceStepV4ConditionGenerationModel` architecture.
+Mula Edit regenerates a selected interval of an existing recording using vocal melody, instrumental melody, chords, and lyrics. `POST /v1/music/edit` accepts JSON containing `music_url` and returns a 48 kHz stereo WAV file. The implementation loads the v5 checkpoint with the `AceStepV4ConditionGenerationModel` architecture.
 
 ## Launch
 
@@ -24,14 +24,13 @@ For GPUs without native BF16 support, such as NVIDIA T4, add `--edit.factory.dty
 All timestamps are seconds from the beginning of the original recording. Supply the desired score directly; this endpoint does not transcribe the source audio or parse ABC notation.
 
 ```python
-import base64
 from pathlib import Path
 
 import httpx
 
 request = {
     "model": "mula-edit",
-    "audio_base64": base64.b64encode(Path("input.wav").read_bytes()).decode(),
+    "music_url": "https://example.com/input.wav",
     "start_seconds": 10.0,
     "end_seconds": 12.0,
     "symbols": {
@@ -60,9 +59,9 @@ Chord parsing follows the training behavior. Unknown qualities, such as `C:maj9`
 
 An empty slot `[]` explicitly supplies no notes. A null slot leaves that condition unknown. With `symbolic_scope="whole"` (the default), the supplied score describes the entire recording. Use `"span"` when only the selected interval's score is available; symbols outside it are hidden. Lyrics are supplied for the whole recording and use the model's 512-token encoding limit; captions and musical metadata share its 256-token prompt limit.
 
-`audio_base64` contains a complete encoded audio file without a data URL prefix. WAV and FLAC are supported by the audio decoder. Mono input is duplicated to stereo, additional channels are discarded, and audio is resampled to 48 kHz. The encoded file limit is 128 MiB. The duration limit defaults to 360 seconds (inclusive) and can be configured with `--edit.factory.max_audio_seconds`, up to 600 seconds. Oversized recordings and edit intervals extending beyond the recording are rejected instead of truncated.
+The required `music_url` accepts HTTP and HTTPS links, including signed URLs; replace the example URL with an accessible audio link. The server downloads the audio into memory and passes the bytes to the model without writing an audio file to disk. The former `audio_base64` field is no longer accepted. WAV and FLAC are supported by the audio decoder. Mono input is duplicated to stereo, additional channels are discarded, and audio is resampled to 48 kHz. The audio download limit is 128 MiB, checked against both the response header and bytes received. The duration limit defaults to 360 seconds (inclusive) and can be configured with `--edit.factory.max_audio_seconds`, up to 600 seconds. Oversized recordings and edit intervals extending beyond the recording are rejected instead of truncated.
 
-Sampling controls are `steps` (default 32), `guidance_scale` (7), `shift` (3), `seed` (42), and `crossfade_seconds` (1). The seed controls both VAE posterior sampling and diffusion noise. Successful responses have `Content-Type: audio/wav` and an `X-Request-Id` header. Invalid JSON fields return 422, invalid audio or edit intervals extending beyond the recording return 400, and a full queue returns 503. Streaming is not supported by this endpoint.
+Sampling controls are `steps` (default 32), `guidance_scale` (7), `shift` (3), `seed` (42), and `crossfade_seconds` (1). The seed controls both VAE posterior sampling and diffusion noise. Successful responses have `Content-Type: audio/wav` and an `X-Request-Id` header. Missing or invalid URLs and other invalid JSON fields return 422. Failed downloads, empty or invalid audio, and edit intervals extending beyond the recording return 400; unknown model names return 404; downloads over 128 MiB return 413; non-JSON requests return 415; and a full queue returns 503. Streaming is not supported by this endpoint.
 
 ## Serial execution and acceleration
 

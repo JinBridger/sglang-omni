@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Measure speech streaming latency, throughput, and playback buffering."""
+"""Measure HeartMoE music streaming latency, throughput, and playback buffering."""
 
 import argparse
 import asyncio
@@ -12,7 +12,7 @@ import numpy as np
 
 
 async def generate(
-    client: httpx.AsyncClient, endpoint: str, frames: int, seed: int
+    client: httpx.AsyncClient, endpoint: str, max_duration_seconds: float, seed: int
 ) -> dict[str, float]:
     started = time.perf_counter()
     first_audio_seconds = None
@@ -22,9 +22,9 @@ async def generate(
         "POST",
         endpoint,
         json={
-            "input": "[Instrumental]\n",
+            "lyrics": "[Instrumental]\n",
             "instructions": "Jazz piano, upright bass, brushed drums",
-            "max_new_tokens": frames,
+            "max_duration": max_duration_seconds,
             "seed": seed,
             "stream": True,
             "response_format": "pcm",
@@ -68,7 +68,7 @@ async def generate(
 
 
 async def benchmark(arguments: argparse.Namespace) -> None:
-    endpoint = arguments.url.rstrip("/") + "/v1/audio/speech"
+    endpoint = arguments.url.rstrip("/") + "/v1/music/generate"
     results = []
     async with httpx.AsyncClient(
         timeout=600, limits=httpx.Limits(max_connections=64)
@@ -76,7 +76,7 @@ async def benchmark(arguments: argparse.Namespace) -> None:
         for concurrency in arguments.concurrency:
             await asyncio.gather(
                 *(
-                    generate(client, endpoint, arguments.frames, i)
+                    generate(client, endpoint, arguments.max_duration_seconds, i)
                     for i in range(concurrency)
                 )
             )
@@ -89,7 +89,7 @@ async def benchmark(arguments: argparse.Namespace) -> None:
                             generate(
                                 client,
                                 endpoint,
-                                arguments.frames,
+                                arguments.max_duration_seconds,
                                 20261105 + i + repeat * concurrency,
                             )
                             for i in range(concurrency)
@@ -126,7 +126,13 @@ async def benchmark(arguments: argparse.Namespace) -> None:
             print(json.dumps(row), flush=True)
             results.append(dict(**row, measurements=measurements))
             arguments.output.write_text(
-                json.dumps({"frames": arguments.frames, "results": results}, indent=2)
+                json.dumps(
+                    {
+                        "max_duration": arguments.max_duration_seconds,
+                        "results": results,
+                    },
+                    indent=2,
+                )
                 + "\n"
             )
 
@@ -134,7 +140,13 @@ async def benchmark(arguments: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8000")
-    parser.add_argument("--frames", type=int, default=375)
+    parser.add_argument(
+        "--max-duration",
+        dest="max_duration_seconds",
+        type=float,
+        default=30,
+        help="Maximum audio duration in seconds (0.08 to 600)",
+    )
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)

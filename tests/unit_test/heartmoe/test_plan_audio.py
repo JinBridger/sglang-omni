@@ -6,6 +6,7 @@ from typing import Literal
 
 import pytest
 import torch
+from pydantic import JsonValue
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.sampler import Sampler
@@ -37,6 +38,7 @@ from sglang_omni.models.heartmoe.request import (
 from sglang_omni.models.heartmoe.runner import HeartMoERunner
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.serve.music_generation import MusicGenerationRequest
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.speech_service import SpeechRequestValidator
 from tests.unit_test.fixtures.sampling import production_sampler_context
@@ -139,6 +141,69 @@ def speech_request(
     # note (Codex): The byte tokenizer isolates prompts; generation retains the checkpoint vocabulary.
     state.req.vocab_size = 248080
     return state
+
+
+@pytest.mark.parametrize("task_type", ["Direct", "PlanFull"])
+@pytest.mark.parametrize(
+    ("duration_fields", "expected_audio_frames"),
+    [
+        ({}, 375),
+        ({"max_duration": None}, 375),
+        ({"max_duration": 0.08}, 1),
+        ({"max_duration": 0.24}, 3),
+        ({"max_duration": 2.32}, 29),
+        ({"max_duration": 1}, 12),
+        ({"max_duration": 30.07}, 375),
+        ({"max_duration": 600}, 7500),
+        (
+            {
+                "max_duration": 1,
+                "stage_params": {"heartmoe_ar": {"max_duration": 2.32}},
+            },
+            29,
+        ),
+        (
+            {
+                "max_duration": 1,
+                "stage_params": {"heartmoe_ar": {"max_duration": None}},
+            },
+            12,
+        ),
+    ],
+)
+def test_music_duration_controls_audio_frame_budget(
+    task_type: str,
+    duration_fields: dict[str, JsonValue],
+    expected_audio_frames: int,
+) -> None:
+    """Seconds must bound audio frames without charging ABC planning against the duration."""
+    validator = SpeechRequestValidator(
+        default_model="heartmoe",
+        supported_speech_fields=HeartMoEPipelineConfig.supported_speech_fields,
+    )
+    body = MusicGenerationRequest.model_validate(
+        {"lyrics": "[Instrumental]", "task_type": task_type, **duration_fields}
+    )
+    prepared = body.prepare_generation(validator)
+    generated = validator.build_generate_request(prepared.request)
+    state = build_request(
+        StagePayload(
+            request_id="duration-test",
+            request=OmniRequest(
+                inputs=generated.prompt,
+                params=build_params(generated),
+                metadata=generated.metadata,
+            ),
+            data={},
+        ),
+        text_tokenizer(),
+        context_length=16384,
+        max_abc_tokens=4,
+    )
+    assert state.options.max_new_tokens == expected_audio_frames
+    assert state.req.sampling_params.max_new_tokens == expected_audio_frames + (
+        6 if task_type == "PlanFull" else 0
+    )
 
 
 @pytest.fixture

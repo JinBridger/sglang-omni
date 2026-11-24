@@ -191,6 +191,7 @@ Community & Resources
    cookbook/heartmoe.md
    cookbook/mula_edit.md
    cookbook/bs_roformer.md
+   cookbook/sheetsage2.md
 
 .. toctree::
    :hidden:

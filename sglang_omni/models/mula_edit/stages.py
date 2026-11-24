@@ -12,7 +12,7 @@ import torch
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.models.mula_edit.audio import SAMPLE_RATE, prepare_audio
-from sglang_omni.models.mula_edit.protocol import MulaEditRequest
+from sglang_omni.models.mula_edit.protocol import MulaEditInput
 from sglang_omni.models.mula_edit.runtime import MulaEditRuntime
 from sglang_omni.models.mula_edit.sampling import SamplingState
 from sglang_omni.proto.request import StagePayload
@@ -113,8 +113,10 @@ class MulaEditScheduler:
                         "This model accepts requests through /v1/music/edit"
                     )
                 else:
-                    request = MulaEditRequest.model_validate(payload.request.inputs)
-                prepared = prepare_audio(request, self.max_audio_seconds)
+                    edit_input = MulaEditInput.model_validate(payload.request.inputs)
+                prepared = prepare_audio(
+                    edit_input.request, edit_input.audio_bytes, self.max_audio_seconds
+                )
                 if self.is_cancelled(payload.request_id):
                     return
                 else:

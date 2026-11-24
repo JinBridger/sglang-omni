@@ -1,6 +1,6 @@
 # BS-RoFormer
 
-BS-RoFormer separates a recording into vocals and instrumental accompaniment. `POST /v1/music/separate` accepts an uploaded audio file and returns a ZIP containing `vocals.wav` and `instrumental.wav` by default, or `vocals.flac` and `instrumental.flac` when the optional `format` form field is `flac`.
+BS-RoFormer separates a recording into vocals and instrumental accompaniment. `POST /v1/music/separate` accepts a JSON body with `music_url` and returns a ZIP containing `vocals.wav` and `instrumental.wav` by default, or `vocals.flac` and `instrumental.flac` when the optional `format` field is `flac`.
 
 ## Launch
 
@@ -27,18 +27,18 @@ Compilation is enabled by default for the frequency-band encoder, Transformer bl
 ## Request
 
 ```bash
-curl --fail-with-body http://localhost:8000/v1/music/separate \
-  -F 'file=@song.mp3' \
-  -F 'model=bs-roformer' \
+curl --fail-with-body "${BASE_URL}/v1/music/separate" \
+  -H 'Content-Type: application/json' \
+  -d '{"music_url":"https://example.com/song.mp3","model":"bs-roformer"}' \
   --output separated.zip
 unzip separated.zip
 ```
 
-The `model` form field is optional. WAV, FLAC, MP3, and OGG inputs supported by libsndfile are accepted. Mono input is duplicated to stereo, and input is resampled to the checkpoint's sample rate, 44.1 kHz for this model. The two WAV files use 32-bit floating-point samples, retain the resampled recording length, and sum back to the input without independent normalization or clipping.
+Set `BASE_URL` to the running server and replace the example URL with an accessible audio link. The required `music_url` accepts HTTP and HTTPS links, including signed URLs; the server downloads the audio into memory without writing an audio file to disk. Multipart uploads are not accepted. The `model` JSON field is optional. WAV, FLAC, MP3, and OGG inputs supported by libsndfile are accepted. Mono input is duplicated to stereo, and input is resampled to the checkpoint's sample rate, 44.1 kHz for this model. The two WAV files use 32-bit floating-point samples, retain the resampled recording length, and sum back to the input without independent normalization or clipping.
 
-Add `-F 'format=flac'` to return `vocals.flac` and `instrumental.flac` encoded as 16-bit PCM FLAC for smaller downloads. Omitting `format` or supplying any other value preserves the default 32-bit floating-point WAV output. Instrumental audio is still computed as input minus vocals before encoding; FLAC export quantizes each stem to 16-bit PCM.
+Add `"format":"flac"` to the JSON body to return `vocals.flac` and `instrumental.flac` encoded as 16-bit PCM FLAC for smaller downloads. Omitting `format` or supplying any other string preserves the default 32-bit floating-point WAV output. Instrumental audio is still computed as input minus vocals before encoding; FLAC export quantizes each stem to 16-bit PCM.
 
-Successful responses use `Content-Type: application/zip`, `Content-Disposition: attachment; filename="separated.zip"`, and an `X-Request-Id` header. Missing uploads return 422; empty or invalid audio returns 400; unknown model names return 404. Uploads over 128 MiB return 413. The duration limit defaults to 600 seconds and is configurable with `--separate.factory.max_audio_seconds`.
+Successful responses use `Content-Type: application/zip`, `Content-Disposition: attachment; filename="separated.zip"`, and an `X-Request-Id` header. Missing or invalid URLs return 422; failed downloads, empty files, and invalid audio return 400; unknown model names return 404. Non-JSON requests, including multipart uploads, return 415. Audio downloads over 128 MiB return 413; the limit is checked against both the response header and bytes received. The duration limit defaults to 600 seconds and is configurable with `--separate.factory.max_audio_seconds`.
 
 ## Request execution
 
@@ -48,7 +48,7 @@ Each GPU worker completes one request before starting the next, using Omni's sha
 
 ## Throughput
 
-Measured on one NVIDIA RTX PRO 6000 Blackwell Server Edition with bfloat16, PyTorch 2.14.1, and `OMP_NUM_THREADS=4`. Each case sends 32 requests containing the same 30-second WAV through local HTTP after two warmup requests. Throughput includes upload, decoding, inference, overlap accumulation, WAV export, and response transfer; model loading and compilation are excluded.
+Measured with the previous multipart upload API on one NVIDIA RTX PRO 6000 Blackwell Server Edition with bfloat16, PyTorch 2.14.1, and `OMP_NUM_THREADS=4`. Each case sends 32 requests containing the same 30-second WAV through local HTTP after two warmup requests. Throughput includes upload, decoding, inference, overlap accumulation, WAV export, and response transfer; model loading and compilation are excluded. These measurements do not include remote audio download latency.
 
 | Execution | Client concurrency | Audio seconds per wall second | GPU memory peak (GiB) |
 | --- | --- | --- | --- |

@@ -70,8 +70,8 @@ _BAD_REQUEST_MARKERS = (
     "Native generation request ",
     "Native chat request rejected: ",
     "HeartMoE Cover requires",
-    "HeartMoE Cover ref_audio contains",
-    "HeartMoE ref_audio is only supported",
+    "HeartMoE Cover score contains",
+    "HeartMoE score is only supported",
     "Invalid UMM request: ",
 )
 _BAD_REQUEST_PATTERNS = (

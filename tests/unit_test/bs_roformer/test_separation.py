@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 from zipfile import ZipFile
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
@@ -33,7 +34,10 @@ from sglang_omni.models.bs_roformer.stages import BSRoFormerScheduler
 from sglang_omni.pipeline.mp_runner import resolve_coordinator_max_in_flight
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.serve import music_separation
 from sglang_omni.serve.openai_api import create_app
+
+pytest_plugins = ["tests.unit_test.fixtures.media_download"]
 
 
 @pytest.fixture
@@ -259,6 +263,7 @@ def test_endpoint_returns_zip_through_pipeline_client(
     output_format: str | None,
     audio_format: Literal["WAV", "FLAC"],
     audio_subtype: Literal["FLOAT", "PCM_16"],
+    audio_download: tuple[list[httpx.Request], list[httpx.Response | httpx.HTTPError]],
 ) -> None:
     requests: list[OmniRequest] = []
 
@@ -283,13 +288,21 @@ def test_endpoint_returns_zip_through_pipeline_client(
     reference = BSRoFormerScheduler(runtime, 1).separate(
         payload("reference", audio_bytes)
     )
+    audio_url = "https://media.example/music.wav?signature=a%2Fb%2Bc"
+    audio_download[1][:] = [httpx.Response(200, content=audio_bytes)]
+    body = {"music_url": audio_url}
+    if output_format is not None:
+        body["format"] = output_format
+    else:
+        pass
     with TestClient(application) as client:
         response = client.post(
             "/v1/music/separate",
-            files={"file": ("music.wav", audio_bytes)},
-            data={} if output_format is None else {"format": output_format},
+            json=body,
         )
         assert response.status_code == 200, response.text
+        assert [str(request.url) for request in audio_download[0]] == [audio_url]
+        assert requests[0].inputs == {"audio_bytes": audio_bytes}
         assert response.headers["content-type"] == "application/zip"
         assert 'filename="separated.zip"' in response.headers["content-disposition"]
         with (
@@ -322,15 +335,15 @@ def test_endpoint_returns_zip_through_pipeline_client(
                     rtol=0,
                     atol=1 / 32768 if output_format == "flac" else 0,
                 )
-        for audio_bytes, form, status_code in [
+        for audio_bytes, fields, status_code in [
             (b"", {}, 400),
             (b"broken", {}, 400),
             (audio_upload(10), {"model": "other"}, 404),
         ]:
+            audio_download[1][:] = [httpx.Response(200, content=audio_bytes)]
             response = client.post(
                 "/v1/music/separate",
-                files={"file": ("music.wav", audio_bytes)},
-                data=form,
+                json={"music_url": audio_url, **fields},
             )
             assert response.status_code == status_code, response.text
         assert len(requests) == 2
@@ -340,6 +353,61 @@ def test_endpoint_rejects_other_model_architectures() -> None:
     application = create_app(None, model_name="other", architectures=["OtherModel"])
     with TestClient(application) as client:
         response = client.post(
-            "/v1/music/separate", files={"file": ("music.wav", audio_upload(10))}
+            "/v1/music/separate", json={"music_url": "https://media.example/music.wav"}
         )
         assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"music_url": ""}, {"music_url": "file:///tmp/music.wav"}],
+)
+def test_endpoint_rejects_invalid_urls_before_download(
+    body: dict[str, str],
+    audio_download: tuple[list[httpx.Request], list[httpx.Response | httpx.HTTPError]],
+) -> None:
+    application = create_app(None, architectures=["BSRoFormer"])
+    with TestClient(application) as client:
+        response = client.post("/v1/music/separate", json=body)
+        assert response.status_code == 422
+        assert audio_download[0] == []
+
+
+def test_endpoint_rejects_multipart_uploads() -> None:
+    """Binary uploads must not crash JSON encoding of body validation errors."""
+    application = create_app(None, architectures=["BSRoFormer"])
+    with TestClient(application) as client:
+        response = client.post(
+            "/v1/music/separate", files={"file": ("music.wav", audio_upload(10))}
+        )
+        assert response.status_code == 415
+        content = client.get("/openapi.json").json()["paths"]["/v1/music/separate"][
+            "post"
+        ]["requestBody"]["content"]
+        assert set(content) == {"application/json"}
+
+
+@pytest.mark.parametrize(
+    ("download_result", "status_code"),
+    [
+        (httpx.Response(200, content=b""), 400),
+        (httpx.Response(404), 400),
+        (httpx.ReadTimeout("Timed out"), 400),
+        (httpx.Response(200, headers={"content-length": "33"}), 413),
+        (httpx.Response(200, stream=httpx.ByteStream(b"x" * 33)), 413),
+    ],
+)
+def test_endpoint_rejects_failed_or_oversized_downloads(
+    download_result: httpx.Response | httpx.HTTPError,
+    status_code: int,
+    audio_download: tuple[list[httpx.Request], list[httpx.Response | httpx.HTTPError]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(music_separation, "MAX_AUDIO_BYTES", 32)
+    audio_download[1][:] = [download_result]
+    application = create_app(None, architectures=["BSRoFormer"])
+    with TestClient(application) as client:
+        response = client.post(
+            "/v1/music/separate", json={"music_url": "https://media.example/music.wav"}
+        )
+        assert response.status_code == status_code, response.text

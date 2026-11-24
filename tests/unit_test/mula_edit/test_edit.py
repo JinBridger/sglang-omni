@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Music edit contracts, source preservation, and serial execution."""
 
-import base64
 import copy
 import io
 import threading
 from typing import TypedDict
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
@@ -17,22 +17,29 @@ from pydantic import ValidationError
 from sglang_omni.admission import QueueFullError
 from sglang_omni.client.client import Client
 from sglang_omni.models.mula_edit.audio import PreparedEdit, prepare_audio
-from sglang_omni.models.mula_edit.protocol import MulaEditRequest
+from sglang_omni.models.mula_edit.protocol import MulaEditInput, MulaEditRequest
 from sglang_omni.models.mula_edit.sampling import MulaSampler, SamplingState
 from sglang_omni.models.mula_edit.stages import MulaEditScheduler
 from sglang_omni.models.mula_edit.symbols import parse_chord, score_events
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.serve import music_edit
 from sglang_omni.serve.openai_api import create_app
 from tests.unit_test.fixtures.mula_edit import sampling_state, small_decoder
 
+pytest_plugins = ["tests.unit_test.fixtures.media_download"]
 
-def edit_request(**changes: object) -> MulaEditRequest:
+
+def audio_recording() -> bytes:
     stream = io.BytesIO()
     sf.write(stream, np.zeros((48001, 2), dtype=np.float32), 48000, format="WAV")
+    return stream.getvalue()
+
+
+def edit_request(**changes: object) -> MulaEditRequest:
     return MulaEditRequest.model_validate(
         {
-            "audio_base64": base64.b64encode(stream.getvalue()).decode(),
+            "music_url": "https://media.example/music.wav?signature=a%2Fb%2Bc",
             "symbols": {
                 "vocal_melody": [[0.2, 0.4, 60]],
                 "instrumental_melody": [],
@@ -129,16 +136,17 @@ def test_score_accepts_unknown_chord_qualities_and_skips_unparseable_labels(
 
 
 def test_audio_keeps_partial_last_frame_and_rejects_truncation() -> None:
-    prepared = prepare_audio(edit_request(), 2)
+    audio_bytes = audio_recording()
+    prepared = prepare_audio(edit_request(), audio_bytes, 2)
     assert prepared.samples == 48001
     assert prepared.waveform.shape == (2, 26 * 1920)
     assert prepared.provided.shape == (1, 26, 3)
     with pytest.raises(ValueError, match="exceeds"):
-        prepare_audio(edit_request(), 1)
+        prepare_audio(edit_request(), audio_bytes, 1)
     with pytest.raises(ValueError, match="beyond"):
-        prepare_audio(edit_request(end_seconds=2), 3)
-    with pytest.raises(ValueError, match="base64"):
-        prepare_audio(edit_request(audio_base64="not an audio file"), 2)
+        prepare_audio(edit_request(end_seconds=2), audio_bytes, 3)
+    with pytest.raises(ValueError, match="Could not decode"):
+        prepare_audio(edit_request(), b"not an audio file", 2)
 
 
 @pytest.mark.parametrize("guidance", [1, 7])
@@ -205,6 +213,8 @@ class Coordinator:
 
     async def submit(self, request_id: str, request: OmniRequest) -> AudioResult:
         self.requests.append((request_id, request))
+        edit_input = MulaEditInput.model_validate(request.inputs)
+        prepare_audio(edit_input.request, edit_input.audio_bytes, 2)
         return {
             "audio_waveform": np.zeros((2, 4800), dtype=np.float32).tobytes(),
             "audio_waveform_shape": [2, 4800],
@@ -215,7 +225,11 @@ class Coordinator:
         pass
 
 
-def test_endpoint_delivers_stereo_wav_through_real_client() -> None:
+def test_endpoint_delivers_stereo_wav_through_real_client(
+    audio_download: tuple[list[httpx.Request], list[httpx.Response | httpx.HTTPError]],
+) -> None:
+    audio_bytes = audio_recording()
+    audio_download[1][:] = [httpx.Response(200, content=audio_bytes)]
     coordinator = Coordinator()
     application = create_app(
         Client(coordinator),
@@ -234,12 +248,104 @@ def test_endpoint_delivers_stereo_wav_through_real_client() -> None:
         [(request_id, request)] = coordinator.requests
         assert response.headers["x-request-id"] == request_id
         assert request.metadata["task"] == "mula_edit"
-        assert request.inputs["symbols"]["vocal_melody"] == [[0.2, 0.4, 60]]
+        assert request.inputs["request"]["symbols"]["vocal_melody"] == [[0.2, 0.4, 60]]
+        assert request.inputs["request"]["start_seconds"] == 0.2
+        assert request.inputs["request"]["end_seconds"] == 0.8
+        assert request.inputs["audio_bytes"] == audio_bytes
+        assert [str(request.url) for request in audio_download[0]] == [
+            str(edit_request().music_url)
+        ]
+        request_schema = client.get("/openapi.json").json()["components"]["schemas"][
+            "MulaEditRequest"
+        ]
+        assert "music_url" in request_schema["required"]
+        assert "audio_base64" not in request_schema["properties"]
         response = client.post(
             "/v1/music/edit", json=edit_request(model="other").model_dump(mode="json")
         )
         assert response.status_code == 404
         assert len(coordinator.requests) == 1
+        assert len(audio_download[0]) == 1
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"music_url": None},
+        {"music_url": ""},
+        {"music_url": "file:///tmp/music.wav"},
+        {"audio_base64": "YXVkaW8="},
+    ],
+)
+def test_endpoint_rejects_invalid_url_or_legacy_audio_before_download(
+    fields: dict[str, str | None],
+    audio_download: tuple[list[httpx.Request], list[httpx.Response | httpx.HTTPError]],
+) -> None:
+    coordinator = Coordinator()
+    application = create_app(
+        Client(coordinator), architectures=["AceStepV4ConditionGenerationModel"]
+    )
+    body = {**edit_request().model_dump(mode="json"), **fields}
+    with TestClient(application) as client:
+        response = client.post("/v1/music/edit", json=body)
+    assert response.status_code == 422
+    assert audio_download[0] == []
+    assert coordinator.requests == []
+
+
+@pytest.mark.parametrize(
+    ("download_result", "status_code"),
+    [
+        (httpx.Response(200, content=b""), 400),
+        (httpx.Response(404), 400),
+        (httpx.ReadTimeout("Timed out"), 400),
+        (httpx.Response(200, headers={"content-length": "33"}), 413),
+        (httpx.Response(200, stream=httpx.ByteStream(b"x" * 33)), 413),
+    ],
+)
+def test_endpoint_rejects_failed_or_oversized_downloads(
+    download_result: httpx.Response | httpx.HTTPError,
+    status_code: int,
+    audio_download: tuple[list[httpx.Request], list[httpx.Response | httpx.HTTPError]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(music_edit, "MAX_AUDIO_BYTES", 32)
+    audio_download[1][:] = [download_result]
+    coordinator = Coordinator()
+    application = create_app(
+        Client(coordinator), architectures=["AceStepV4ConditionGenerationModel"]
+    )
+    with TestClient(application) as client:
+        response = client.post(
+            "/v1/music/edit", json=edit_request().model_dump(mode="json")
+        )
+    assert response.status_code == status_code, response.text
+    assert coordinator.requests == []
+
+
+@pytest.mark.parametrize("audio_bytes", [b"broken audio", None])
+def test_endpoint_reports_invalid_audio_or_non_json_requests(
+    audio_bytes: bytes | None,
+    audio_download: tuple[list[httpx.Request], list[httpx.Response | httpx.HTTPError]],
+) -> None:
+    coordinator = Coordinator()
+    application = create_app(
+        Client(coordinator), architectures=["AceStepV4ConditionGenerationModel"]
+    )
+    with TestClient(application) as client:
+        if audio_bytes is None:
+            response = client.post(
+                "/v1/music/edit", files={"file": ("music.wav", b"\xffaudio")}
+            )
+            assert response.status_code == 415
+            assert audio_download[0] == []
+            assert coordinator.requests == []
+        else:
+            audio_download[1][:] = [httpx.Response(200, content=audio_bytes)]
+            response = client.post(
+                "/v1/music/edit", json=edit_request().model_dump(mode="json")
+            )
+            assert response.status_code == 400
 
 
 @pytest.mark.parametrize("cancel_active", [False, True])
@@ -272,7 +378,10 @@ def test_scheduler_serializes_requests_and_releases_cancelled_work(
 
     def submit(scheduler: MulaEditScheduler, request_id: str, seed: int) -> None:
         request = OmniRequest(
-            inputs=edit_request(steps=3, seed=seed).model_dump(mode="json"),
+            inputs={
+                "request": edit_request(steps=3, seed=seed).model_dump(mode="json"),
+                "audio_bytes": audio_recording(),
+            },
             metadata={"task": "mula_edit"},
         )
         payload = StagePayload(request_id=request_id, request=request, data=None)

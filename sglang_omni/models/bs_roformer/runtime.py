@@ -76,7 +76,7 @@ class Separation:
         elif not isinstance(inputs, dict) or not isinstance(
             audio_bytes := inputs.get("audio_bytes"), bytes
         ):
-            raise ValueError("Music separation request: expected uploaded audio bytes")
+            raise ValueError("Music separation request: expected encoded audio bytes")
         else:
             pass
         try:
@@ -89,7 +89,7 @@ class Separation:
                 )
         except sf.LibsndfileError as error:
             raise ValueError(
-                "Music separation request: could not decode the uploaded audio"
+                "Music separation request: could not decode audio"
             ) from error
         if len(waveform) > max_audio_seconds * source_sample_rate:
             raise ValueError(

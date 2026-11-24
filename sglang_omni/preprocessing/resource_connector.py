@@ -103,6 +103,10 @@ class MediaPolicyError(ValueError):
     """Media the server's local path or domain policy refuses to load."""
 
 
+class MediaSizeLimitError(ValueError):
+    """Downloaded media exceeds the configured byte limit."""
+
+
 def resolve_allowed_local_media_path(path: str | Path) -> Path:
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists() or not resolved.is_dir():
@@ -165,14 +169,14 @@ def validate_response_length(
     except ValueError:
         return
     if size > max_bytes:
-        raise ValueError(f"Media URL response exceeds {max_bytes} bytes.")
+        raise MediaSizeLimitError(f"Media URL response exceeds {max_bytes} bytes.")
     else:
         pass
 
 
 def validate_downloaded_size(size: int, *, max_bytes: int | None) -> None:
     if max_bytes is not None and size > max_bytes:
-        raise ValueError(f"Media URL response exceeds {max_bytes} bytes.")
+        raise MediaSizeLimitError(f"Media URL response exceeds {max_bytes} bytes.")
     else:
         pass
 

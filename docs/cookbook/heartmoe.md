@@ -55,9 +55,9 @@ sgl-omni serve \
 
 The AR admission limit and available KV cache jointly constrain concurrency; long ABC scores and audio sequences consume more cache. TP can change floating-point rounding, so the same seed does not guarantee identical samples between TP=1 and TP=2.
 
-## Speech requests
+## Music generation requests
 
-`input` contains lyrics, and `instructions` describes the style. For instrumental music, set `task_type` to `Instrumental` and describe the music in `instructions`. The speech API still requires non-empty `input`; use `[Instrumental]` as a placeholder. This task ignores the input lyrics and always sends an empty lyrics block. One generated frame represents 0.08 seconds; `max_new_tokens=375` caps audio at 30 seconds. The model can finish earlier on EOS.
+`POST /v1/music/generate` accepts a JSON body. `lyrics` contains lyrics, and `instructions` describes the style. For instrumental music, set `task_type` to `Instrumental` and describe the music in `instructions`. The music API still requires non-empty `lyrics`; use `[Instrumental]` as a placeholder. This task ignores the input lyrics and always sends an empty lyrics block. `max_duration` sets the maximum audio duration in seconds (default: 30). Fractional seconds are supported and rounded down to complete 0.08-second audio frames. The model can finish earlier on EOS.
 
 Select the generation task with `task_type`:
 
@@ -69,16 +69,16 @@ Select the generation task with `task_type`:
 | `Cover` | `plan_audio` | `full` | User-supplied full ABC score, then audio |
 | `Instrumental` | `plan_audio` | `full` | Full ABC score, then instrumental audio without vocals or lyrics |
 
-The requests below use `Instrumental`. Omit `task_type` to select `PlanFull`, or set it to `Direct` for direct audio generation. The speech endpoint returns audio; the ABC score conditions generation internally. Streaming audio begins after planning completes. ABC tokens do not consume the `max_new_tokens` audio frame budget. For `PlanFull`, `PlanMelody`, and `Instrumental`, the server allows at most 4,096 ABC content tokens, reduced when needed to reserve context for the requested audio. If the score reaches that limit without its end marker, the server preserves those tokens, inserts the ABC end marker followed by the audio start marker, and continues generating audio. A model-generated ABC end marker can start audio earlier. Configure a lower ABC limit and the sampling temperature with `--heartmoe_ar.factory.max_abc_tokens` and `--heartmoe_ar.factory.abc_temperature` (defaults: 4096 and 0.7); ABC sampling uses the request's `top_k`, `top_p`, and `seed`.
+The requests below use `Instrumental`. Omit `task_type` to select `PlanFull`, or set it to `Direct` for direct audio generation. The music endpoint returns audio; the ABC score conditions generation internally. Streaming audio begins after planning completes. ABC planning does not consume the `max_duration` audio budget. For `PlanFull`, `PlanMelody`, and `Instrumental`, the server allows at most 4,096 ABC content tokens, reduced when needed to reserve context for the requested audio. If the score reaches that limit without its end marker, the server preserves those tokens, inserts the ABC end marker followed by the audio start marker, and continues generating audio. A model-generated ABC end marker can start audio earlier. Configure a lower ABC limit and the sampling temperature with `--heartmoe_ar.factory.max_abc_tokens` and `--heartmoe_ar.factory.abc_temperature` (defaults: 4096 and 0.7); ABC sampling uses the request's `top_k`, `top_p`, and `seed`.
 
 ```bash
-curl --fail-with-body http://localhost:8000/v1/audio/speech \
+curl --fail-with-body http://localhost:8000/v1/music/generate \
   -H 'Content-Type: application/json' \
   -d '{
     "task_type": "Instrumental",
-    "input": "[Instrumental]\n",
+    "lyrics": "[Instrumental]\n",
     "instructions": "Jazz piano, upright bass, brushed drums",
-    "max_new_tokens": 375,
+    "max_duration": 30,
     "seed": 20261105,
     "response_format": "wav"
   }' --output music.wav
@@ -87,32 +87,32 @@ curl --fail-with-body http://localhost:8000/v1/audio/speech \
 For actual incremental delivery, set `stream=true`; merely streaming the HTTP download without this field does not enable incremental generation.
 
 ```bash
-curl --no-buffer --fail-with-body http://localhost:8000/v1/audio/speech \
+curl --no-buffer --fail-with-body http://localhost:8000/v1/music/generate \
   -H 'Content-Type: application/json' \
   -d '{
     "task_type": "Instrumental",
-    "input": "[Instrumental]\n",
+    "lyrics": "[Instrumental]\n",
     "instructions": "Jazz piano, upright bass, brushed drums",
-    "max_new_tokens": 375,
+    "max_duration": 30,
     "seed": 20261105,
     "stream": true,
     "response_format": "pcm"
   }' --output music.pcm
 ```
 
-The sample rate is 48 kHz. Non-streaming WAV/FLAC/MP3 retain stereo. HTTP streaming PCM/WAV and SSE preserve HeartCodec's two channels. Streamed PCM is signed 16-bit little-endian, interleaved left/right; read `X-Channels`, `X-Sample-Rate`, and `X-Bit-Depth` from the response instead of assuming mono. WAV headers describe both channels, and SSE duration accounts for both channels. At 48 kHz, stereo PCM uses 192,000 bytes per second. Non-streaming raw PCM retains the existing mono encoding. The SSE stream includes `speech.audio.delta` events and a terminal `speech.audio.done` event.
+The sample rate is 48 kHz. Non-streaming WAV/FLAC/MP3 retain stereo. HTTP streaming PCM/WAV and SSE preserve HeartCodec's two channels. Streamed PCM is signed 16-bit little-endian, interleaved left/right; read `X-Channels`, `X-Sample-Rate`, and `X-Bit-Depth` from the response instead of assuming mono. WAV headers describe both channels, and SSE duration accounts for both channels. At 48 kHz, stereo PCM uses 192,000 bytes per second. Non-streaming raw PCM retains the existing mono encoding. Finished stream outcomes are available at `GET /v1/music/generate/{request_id}`. The SSE stream includes `speech.audio.delta` events and a terminal `speech.audio.done` event.
 
-For `Cover`, put the reference lead-sheet ABC score as raw text in `ref_audio`. Its dedicated prompt asks the model to preserve the melody, section structure, and any chord progression while following `instructions` for genre, mood, instruments, vocal gender and timbre, tempo, and any specified key. Otherwise, it retains the score's key. The supplied score remains between the assistant's ABC markers, and generation starts at the audio boundary without generating or rewriting ABC. Do not supply an audio file, URL, base64 audio, or modality markers in this field. Missing or blank scores are rejected. The score counts as input context, not generated ABC, and is not subject to the ABC generation limit. The score and requested audio must still fit the model's context. All other request requirements and audio sampling settings are the same as `Direct`; the default remains `PlanFull`.
+For `Cover`, put the reference lead-sheet ABC score as raw text in `score`. Its dedicated prompt asks the model to preserve the melody, section structure, and any chord progression while following `instructions` for genre, mood, instruments, vocal gender and timbre, tempo, and any specified key. Otherwise, it retains the score's key. The supplied score remains between the assistant's ABC markers, and generation starts at the audio boundary without generating or rewriting ABC. Do not supply an audio file, URL, base64 audio, or modality markers in this field. Missing or blank scores are rejected. The score counts as input context, not generated ABC, and is not subject to the ABC generation limit. The score and requested audio must still fit the model's context. All other request requirements and audio sampling settings are the same as `Direct`; the default remains `PlanFull`.
 
 ```bash
-curl --fail-with-body http://localhost:8000/v1/audio/speech \
+curl --fail-with-body http://localhost:8000/v1/music/generate \
   -H 'Content-Type: application/json' \
   -d '{
     "task_type": "Cover",
-    "input": "[Instrumental]",
+    "lyrics": "[Instrumental]",
     "instructions": "Solo piano, gentle and clear",
-    "ref_audio": "X:1\nT:Example\nM:4/4\nL:1/4\nQ:1/4=100\nK:C\nC D E G | G E D C |]",
-    "max_new_tokens": 375,
+    "score": "X:1\nT:Example\nM:4/4\nL:1/4\nQ:1/4=100\nK:C\nC D E G | G E D C |]",
+    "max_duration": 30,
     "response_format": "wav"
   }' --output cover.wav
 ```
@@ -120,8 +120,8 @@ curl --fail-with-body http://localhost:8000/v1/audio/speech \
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `task_type` | `null` | `Direct`, `PlanFull`, `PlanMelody`, `Cover`, or `Instrumental`; `null` selects `PlanFull` |
-| `ref_audio` | `null` | Required raw ABC score for `Cover`; unsupported for other HeartMoE tasks |
-| `max_new_tokens` | 375 | Audio frame cap, from 1 to 7,500 |
+| `score` | `null` | Required raw ABC score for `Cover`; unsupported for other HeartMoE tasks |
+| `max_duration` | 30 | Maximum audio duration in seconds, from 0.08 to 600; omitted or `null` uses the default |
 | `temperature` | CB0: 1.2; CB1–7: 0.8 | An explicit value overrides both audio temperatures; 0 selects greedy decoding |
 | `top_k` | 50 | Candidate count for CB1–7 and ABC; 0 disables top-k |
 | `top_p` | 0.95 | Nucleus probability for CB1–7 and ABC |
@@ -131,11 +131,11 @@ curl --fail-with-body http://localhost:8000/v1/audio/speech \
 
 All three generation paths use the production SGLang sampler. CB0 first keeps raw logits at least `max(logits) + ln(0.05)`, before applying temperature. Rejected logits become `max(logits) - 10000`, keeping sampler inputs finite. CB0 then samples at temperature 1.2 without top-k or top-p; EOS participates in the same filter as ordinary codes. CB1–7 sample at temperature 0.8, top-k 50, and top-p 0.95. ABC uses temperature 0.7, top-k 50, and top-p 0.95 by default.
 
-For independent per-request settings, use `stage_params.heartmoe_ar`. It accepts `first_codebook_temperature`, `first_codebook_min_p`, `abc_temperature`, and the sampling fields in the table. Stage values override top-level values. An explicit `temperature` sets both audio temperatures unless `first_codebook_temperature` is also supplied; `top_k` and `top_p` never filter CB0. `first_codebook_min_p=0` disables the CB0 gate, and `1` retains only maximum-logit codes. For example:
+For independent per-request settings, use `stage_params.heartmoe_ar`. It accepts `first_codebook_temperature`, `first_codebook_min_p`, `abc_temperature`, and the sampling fields in the table. Stage values override top-level values, including `max_duration` in seconds. The former `max_new_tokens` field is rejected at both levels. An explicit `temperature` sets both audio temperatures unless `first_codebook_temperature` is also supplied; `top_k` and `top_p` never filter CB0. `first_codebook_min_p=0` disables the CB0 gate, and `1` retains only maximum-logit codes. For example:
 
 ```json
 {
-  "input": "[Instrumental]",
+  "lyrics": "[Instrumental]",
   "stage_params": {
     "heartmoe_ar": {
       "first_codebook_temperature": 1.2,
@@ -176,7 +176,7 @@ These options preserve FP32 weights, TF32, the window geometry, and the flow ste
 
 ```bash
 python benchmarks/bench_heartmoe.py \
-  --url http://localhost:8000 --frames 375 \
+  --url http://localhost:8000 --max-duration 30 \
   --concurrency 1 2 4 8 16 --repeats 3 \
   --output heartmoe-benchmark.json
 ```
