@@ -188,10 +188,6 @@ Community & Resources
    cookbook/companies/autoark_ai.md
    cookbook/companies/mistral_ai.md
    cookbook/companies/dots_studio.md
-   cookbook/heartmoe.md
-   cookbook/mula_edit.md
-   cookbook/bs_roformer.md
-   cookbook/sheetsage2.md
 
 .. toctree::
    :hidden:

@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-import numpy as np
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -24,7 +23,6 @@ from sglang_omni.client import Client, ClientError, GenerateChunk
 from sglang_omni.client.audio import encode_pcm
 from sglang_omni.client.client import StreamedStopTrimmer, extract_inputs
 from sglang_omni.client.types import GenerateRequest, UsageInfo
-from sglang_omni.models.heartmoe.config import HeartMoEPipelineConfig
 from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
 from sglang_omni.scheduling.types import SpecTokensDetailsDict
@@ -1968,256 +1966,6 @@ def test_speech_stream_headers_use_chunk_sample_rate() -> None:
     assert response.content[44:] == expected
 
 
-@pytest.mark.parametrize(
-    "task_type", [None, "Direct", "PlanFull", "PlanMelody", "Instrumental", "cover"]
-)
-def test_heartmoe_music_generation_passes_lyrics_and_score(
-    task_type: str | None,
-) -> None:
-    """The music API must pass the renamed fields through to HeartMoE generation."""
-    speech_client = SuccessfulSpeechClient(sample_rate=48000, finish_reason="length")
-    score = "X:1\nT:音乐\nK:C\nC D E F|" if task_type == "cover" else None
-    lyrics = "[Verse]\n夜空中的星光"
-    client = TestClient(
-        create_app(
-            speech_client,
-            model_name="heartmoe",
-            architectures=[HeartMoEPipelineConfig.architecture],
-            supported_speech_fields=HeartMoEPipelineConfig.supported_speech_fields,
-        )
-    )
-    response = client.post(
-        "/v1/music/generate",
-        json={
-            "lyrics": lyrics,
-            "score": score,
-            "task_type": task_type,
-            "instructions": "Gentle piano",
-            "max_duration": 0.96,
-            "seed": 123,
-            "response_format": "wav",
-            "stage_params": {"heartmoe_ar": {"abc_temperature": 0.2}},
-        },
-    )
-    assert response.status_code == 200, response.text
-    assert response.content == b"RIFF"
-    assert response.headers["content-type"] == "audio/wav"
-    assert response.headers["x-finish-reason"] == "length"
-    assert response.headers["x-prompt-tokens"] == "5"
-    [generated] = speech_client.speech_requests
-    assert generated.prompt == lyrics
-    assert generated.metadata["tts_params"].get("ref_audio") == score
-    assert generated.metadata["tts_params"].get("task_type") == (
-        "Cover" if task_type == "cover" else task_type
-    )
-    assert generated.metadata["tts_params"]["instructions"] == "Gentle piano"
-    assert generated.metadata["tts_params"]["seed"] == 123
-    assert generated.sampling.max_new_tokens == 12
-    assert generated.stage_params == {"heartmoe_ar": {"abc_temperature": 0.2}}
-    assert client.post("/v1/audio/speech", json={"input": lyrics}).status_code == 404
-    schema = client.get("/openapi.json").json()
-    assert "/v1/music/generate" in schema["paths"]
-    assert "/v1/audio/speech" not in schema["paths"]
-    fields = schema["components"]["schemas"]["MusicGenerationRequest"]["properties"]
-    assert {"lyrics", "score", "max_duration"} <= fields.keys()
-    assert not {"input", "ref_audio", "max_new_tokens"} & fields.keys()
-
-
-@pytest.mark.parametrize(
-    ("body", "status_code", "field_name"),
-    [
-        ({}, 422, "lyrics"),
-        ({"lyrics": 123}, 422, "lyrics"),
-        ({"lyrics": "   "}, 400, "lyrics"),
-        ({"lyrics": "la" * 10}, 400, "lyrics"),
-        ({"lyrics": "la", "input": "old lyrics"}, 422, "input"),
-        ({"lyrics": "la", "ref_audio": "old score"}, 422, "ref_audio"),
-        ({"lyrics": "la", "task_type": "Cover"}, 400, "score"),
-        ({"lyrics": "la", "task_type": "Cover", "score": "  "}, 400, "score"),
-        ({"lyrics": "la", "task_type": "Cover", "score": {}}, 422, "score"),
-        ({"lyrics": "la", "score": "X:1\nK:C\nC|"}, 400, "score"),
-        ({"lyrics": "la", "task_type": "Base"}, 400, "task_type"),
-        ({"lyrics": "la", "max_new_tokens": 375}, 422, "max_new_tokens"),
-        ({"lyrics": "la", "max_duration": 0}, 422, "max_duration"),
-        ({"lyrics": "la", "max_duration": -1}, 422, "max_duration"),
-        ({"lyrics": "la", "max_duration": 0.079}, 422, "max_duration"),
-        ({"lyrics": "la", "max_duration": 600.01}, 422, "max_duration"),
-        ({"lyrics": "la", "max_duration": "30"}, 422, "max_duration"),
-        ({"lyrics": "la", "max_duration": True}, 422, "max_duration"),
-        (
-            {
-                "lyrics": "la",
-                "stage_params": {"heartmoe_ar": {"max_new_tokens": 375}},
-            },
-            400,
-            "stage_params.heartmoe_ar.max_new_tokens",
-        ),
-        (
-            {
-                "lyrics": "la",
-                "stage_params": {"heartmoe_ar": {"max_duration": 0.01}},
-            },
-            400,
-            "stage_params.heartmoe_ar.max_duration",
-        ),
-        (
-            {
-                "lyrics": "la",
-                "stage_params": {"heartmoe_ar": {"max_duration": "30"}},
-            },
-            400,
-            "stage_params.heartmoe_ar.max_duration",
-        ),
-    ],
-)
-def test_heartmoe_music_generation_rejects_invalid_fields(
-    body: dict[str, object], status_code: int, field_name: str
-) -> None:
-    """Invalid music requests and old field names must fail before generation."""
-    speech_client = SuccessfulSpeechClient()
-    client = TestClient(
-        create_app(
-            speech_client,
-            model_name="heartmoe",
-            architectures=[HeartMoEPipelineConfig.architecture],
-            supported_speech_fields=HeartMoEPipelineConfig.supported_speech_fields,
-            max_speech_input_chars=10,
-        )
-    )
-    response = client.post("/v1/music/generate", json=body)
-    assert response.status_code == status_code, response.text
-    if status_code == 400:
-        assert response.json()["error"]["param"] == field_name
-        assert field_name in response.json()["error"]["message"]
-    else:
-        assert field_name in {error["loc"][-1] for error in response.json()["detail"]}
-    assert speech_client.speech_requests == []
-    assert speech_client.generate_requests == []
-
-
-@pytest.mark.parametrize("music_generation", [False, True])
-@pytest.mark.parametrize("stream_format", ["audio", "sse"])
-@pytest.mark.parametrize("response_format", ["pcm", "wav"])
-@pytest.mark.parametrize("channel_last", [False, True])
-def test_speech_stream_preserves_stereo_and_terminal_tail(
-    stream_format: Literal["audio", "sse"],
-    response_format: Literal["pcm", "wav"],
-    channel_last: bool,
-    music_generation: bool,
-) -> None:
-    """Streaming averaged stereo channels and must now retain their samples, tail, and duration."""
-    waveform = np.repeat(
-        np.array(
-            [[0.0, 0.25, 0.5, 0.75, 1.0, -1.0], [1.0, 0.75, 0.5, 0.25, 0.0, -0.5]],
-            dtype=np.float32,
-        ),
-        800,
-        axis=1,
-    )
-    chunks = [
-        GenerateChunk(
-            request_id="speech-stereo",
-            modality="audio",
-            audio_data=audio.T if channel_last else audio,
-            sample_rate=48000,
-            finish_reason=finish_reason,
-        )
-        for audio, finish_reason in ((waveform[:, :2400], None), (waveform, "stop"))
-    ]
-    endpoint = "/v1/music/generate" if music_generation else "/v1/audio/speech"
-    client = TestClient(
-        create_app(
-            ScriptedStreamingSpeechClient(chunks),
-            model_name="heartmoe",
-            architectures=(
-                [HeartMoEPipelineConfig.architecture] if music_generation else []
-            ),
-            supported_speech_fields=HeartMoEPipelineConfig.supported_speech_fields,
-        )
-    )
-    response = client.post(
-        endpoint,
-        json={
-            "lyrics" if music_generation else "input": "[Instrumental]",
-            "stream": True,
-            "stream_format": stream_format,
-            "response_format": response_format,
-        },
-    )
-    assert response.status_code == 200
-    assert response.headers["x-channels"] == "2"
-    assert response.headers["x-sample-rate"] == "48000"
-    assert response.headers["x-bit-depth"] == "16"
-    if stream_format == "sse":
-        events = parse_speech_sse_events(response.text, False)
-        assert events[-1]["type"] == "speech.audio.done"
-        assert events[-1]["duration"] == pytest.approx(0.1)
-        audio_bytes = b"".join(
-            base64.b64decode(event["audio"]) for event in events[:-1]
-        )
-    else:
-        audio_bytes = response.content
-        outcome = client.get(f"{endpoint}/{response.headers['x-request-id']}").json()
-        assert outcome["finish_reason"] == "stop"
-    if response_format == "wav":
-        assert audio_bytes[:4] == b"RIFF"
-        assert struct.unpack("<HHIIHH", audio_bytes[20:36]) == (
-            1,
-            2,
-            48000,
-            192000,
-            4,
-            16,
-        )
-        audio_bytes = audio_bytes[44:]
-    else:
-        pass
-    expected_frames = [
-        (0, 32767),
-        (8191, 24575),
-        (16383, 16383),
-        (24575, 8191),
-        (32767, 0),
-        (-32767, -16383),
-    ]
-    assert audio_bytes == b"".join(
-        struct.pack("<hh", *frame) * 800 for frame in expected_frames
-    )
-
-
-def test_speech_sse_rejects_channel_changes_after_audio() -> None:
-    """A stream cannot send mono samples after advertising stereo in its headers."""
-    speech_client = ScriptedStreamingSpeechClient(
-        [
-            GenerateChunk(
-                request_id="changing-channels",
-                audio_data=[[0.1] * 8, [-0.2] * 8],
-                sample_rate=48000,
-            ),
-            GenerateChunk(
-                request_id="changing-channels", audio_data=[0.3] * 8, sample_rate=48000
-            ),
-        ]
-    )
-    client = TestClient(create_app(speech_client, model_name="tts"))
-    response = client.post(
-        "/v1/audio/speech",
-        json={"input": "hello", "stream_format": "sse", "response_format": "pcm"},
-    )
-    assert response.status_code == 200
-    assert response.headers["x-channels"] == "2"
-    events = parse_speech_sse_events(response.text, False)
-    assert [event["type"] for event in events] == ["speech.audio.delta", "error"]
-    assert (
-        events[-1]["error"]["message"]
-        == "Speech stream channel count changed from 2 to 1"
-    )
-    assert events[-1]["error"]["partial_audio"] is True
-    assert events[-1]["error"]["action"] == "discard"
-    assert speech_client.closed
-    assert len(speech_client.aborted) == 1
-
-
 @pytest.mark.parametrize("response_format", ["wav", "pcm"])
 def test_speech_stream_records_terminal_state_from_a_later_chunk(
     response_format: Literal["wav", "pcm"],
@@ -2516,7 +2264,6 @@ def test_speech_sse_preserves_audio_and_reports_terminal_usage(
     assert speech_client.aborted == []
 
 
-@pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize(
     ("response_format", "speed", "expected_samples", "expected_duration_seconds"),
     [("wav", 0.25, 19200, 0.8), ("pcm", 4.0, 1200, 0.05)],
@@ -2526,7 +2273,6 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
     speed: float,
     expected_samples: int,
     expected_duration_seconds: float,
-    channels: int,
 ) -> None:
     """SSE duration describes the speed-adjusted PCM and excludes the WAV header."""
     speech_client = ScriptedStreamingSpeechClient(
@@ -2534,9 +2280,7 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
             GenerateChunk(
                 request_id="speech-speed",
                 modality="audio",
-                audio_data=(
-                    [0.1] * 4800 if channels == 1 else [[0.1] * 4800, [-0.2] * 4800]
-                ),
+                audio_data=[0.1] * 4800,
                 sample_rate=24000,
                 finish_reason="stop",
             )
@@ -2556,7 +2300,6 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
 
     assert response.status_code == 200
     assert response.headers["x-sample-rate"] == "24000"
-    assert response.headers["x-channels"] == str(channels)
     events = [
         json.loads(line.removeprefix("data: "))
         for line in response.iter_lines()
@@ -2568,11 +2311,8 @@ def test_speech_sse_speed_changes_audio_length_and_duration(
         audio_bytes = audio_bytes[44:]
     else:
         pass
-    assert len(audio_bytes) == expected_samples * 2 * channels
-    expected_frame = (
-        struct.pack("<h", 3276) if channels == 1 else struct.pack("<hh", 3276, -6553)
-    )
-    assert audio_bytes == expected_frame * expected_samples
+    assert len(audio_bytes) == expected_samples * 2
+    assert audio_bytes == encode_pcm([0.1] * expected_samples, 24000)
     assert events[-1]["type"] == "speech.audio.done"
     assert events[-1]["duration"] == pytest.approx(expected_duration_seconds)
     assert events[-1]["finish_reason"] == "stop"

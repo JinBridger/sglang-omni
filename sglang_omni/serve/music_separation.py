@@ -8,8 +8,11 @@ from fastapi.responses import Response
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 
 from sglang_omni.client.types import GenerateRequest
-from sglang_omni.serve.music_audio import download_music_audio, require_music_json
-from sglang_omni.serve.speech_to_text import complete_speech_to_text_request
+from sglang_omni.serve.music_audio import (
+    complete_music_request,
+    download_music_audio,
+    require_music_json,
+)
 
 MAX_AUDIO_BYTES = 128 * 1024 * 1024
 
@@ -61,12 +64,11 @@ def register_music_separation(app: FastAPI) -> None:
             stream=False,
             metadata={"task": "music_separate", "format": body.output_format},
         )
-        result = await complete_speech_to_text_request(
+        result = await complete_music_request(
             request,
             app.state.client,
             generation,
             request_id=request_id,
-            error_log_message="Music separation failed for %s",
         )
         if not result.media or not isinstance(
             archive_bytes := result.media[0].get("data"), bytes

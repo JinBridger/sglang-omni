@@ -7,8 +7,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError
 
 from sglang_omni.client.types import GenerateRequest, SamplingParams
-from sglang_omni.serve.music_audio import download_music_audio, require_music_json
-from sglang_omni.serve.speech_to_text import complete_speech_to_text_request
+from sglang_omni.serve.music_audio import (
+    complete_music_request,
+    download_music_audio,
+    require_music_json,
+)
 
 
 class MusicTranscriptionRequest(BaseModel):
@@ -52,12 +55,11 @@ def register_music_transcription(app: FastAPI) -> None:
             stream=False,
             metadata={"task": "music_transcribe"},
         )
-        result = await complete_speech_to_text_request(
+        result = await complete_music_request(
             request,
             app.state.client,
             generation,
             request_id=request_id,
-            error_log_message="Music transcription failed for %s",
         )
         try:
             transcription = MusicTranscriptionResponse.model_validate_json(result.text)

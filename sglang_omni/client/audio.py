@@ -329,7 +329,7 @@ def encode_with_pyav(
 def encode_pcm(audio: np.ndarray, sample_rate: int) -> bytes:
     """Encode audio as raw 16-bit PCM bytes."""
     audio = np.clip(audio, -1.0, 1.0)
-    pcm = (audio * 32767.0).astype("<i2")
+    pcm = (audio * 32767.0).astype(np.int16)
     if pcm.ndim == 2:
         pcm = np.ascontiguousarray(pcm.T)
     else:
@@ -342,36 +342,22 @@ def select_audio_delta(
     *,
     emitted_samples: int,
     is_terminal: bool,
-    keep_channels: bool = False,
 ) -> tuple[np.ndarray | None, int]:
-    """Return the un-emitted delta, optionally preserving channel-first mono/stereo."""
+    """Return the un-emitted audio delta from a streaming audio chunk."""
 
     audio = to_numpy(audio_data)
-    if keep_channels:
-        while audio.ndim > 2 and audio.shape[0] == 1:
-            audio = audio[0]
-        if audio.ndim == 2 and audio.shape[0] in (1, 2):
-            pass
-        elif audio.ndim == 2 and audio.shape[-1] in (1, 2):
-            audio = audio.T
-        elif audio.ndim == 0:
-            audio = audio.reshape(1)
-        elif audio.ndim == 1:
-            pass
-        else:
-            raise ValueError(
-                f"Speech streaming requires mono or stereo audio, got shape {audio.shape}"
-            )
+    if audio.ndim > 1:
+        audio = audio.squeeze()
     else:
-        if audio.ndim > 1:
-            audio = audio.squeeze()
-        else:
-            pass
-        if audio.ndim > 1:
-            channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
-            audio = audio.mean(axis=channel_axis).astype("float32")
-        else:
-            pass
+        pass
+    if audio.ndim > 1:
+        # Streaming chunks are mono; downmix multi-channel payloads
+        # (e.g. the 48 kHz stereo MOSS-TTS Local codec) instead of
+        # silently dropping channels.
+        channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
+        audio = audio.mean(axis=channel_axis).astype("float32")
+    else:
+        pass
 
     total_samples = int(audio.shape[-1]) if audio.ndim else 0
     if not is_terminal:
@@ -382,7 +368,7 @@ def select_audio_delta(
         return None, emitted_samples
     else:
         pass
-    return audio[..., emitted_samples:], total_samples
+    return audio[emitted_samples:], total_samples
 
 
 def encode_audio(

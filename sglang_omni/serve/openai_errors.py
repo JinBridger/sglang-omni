@@ -8,8 +8,6 @@ import re
 from sglang_omni.admission import QueueFullError
 
 _BAD_REQUEST_MARKERS = (
-    "Music separation request:",
-    "Mula edit request:",
     "Unsupported language:",
     "longer than the model's context length",
     "Requested token count exceeds the model's maximum context length",
@@ -69,9 +67,6 @@ _BAD_REQUEST_MARKERS = (
     "; packaged voices:",
     "Native generation request ",
     "Native chat request rejected: ",
-    "HeartMoE Cover requires",
-    "HeartMoE Cover score contains",
-    "HeartMoE score is only supported",
     "Invalid UMM request: ",
 )
 _BAD_REQUEST_PATTERNS = (
